@@ -1,4 +1,5 @@
 import cv2
+import torch
 import numpy as np
 import argparse
 import os
@@ -7,6 +8,9 @@ from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
+from pwcnet.model import PWCNet
+# remmenber to install the pwcnet package
+# pip install pwcnet
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
@@ -23,6 +27,9 @@ scale_factor = 1.0
 mouse_coord = (0, 0)
 manual_points = []  # use to SIFT
 
+# 初始化 PWCNet
+pwc_net = PWCNet(pretrained=True)  # 预训练模型
+pwc_net.eval()
 
 # ----------------------- 交互式对象插入模块 -----------------------
 def nothing(x):
@@ -193,54 +200,65 @@ def select_and_correct_points(frame):
     return corrected_points
 
 
-def track_points(video_file, initial_points, resize_dim, visualize=False):
+def track_points_pwcnet(video_file, initial_points, resize_dim, visualize=False):
     """
-    利用光流跟踪，将初始的4个校正点在整个视频中跟踪，
-    返回一个列表，每个元素为当前帧跟踪到的4个点（格式：[(x,y), ...]）。
-    如果 visualize=True，则实时显示窗口“Optical Flow Tracking”。
+    使用 PWCNet 计算光流，跟踪初始点在整个视频中的运动轨迹。
     """
     cap = cv2.VideoCapture(video_file)
     tracked_points = []
-    prev_points = np.array(initial_points, dtype=np.float32).reshape(-1, 1, 2)
-    ret, frame = cap.read()
+
+    ret, frame1 = cap.read()
     if not ret:
         cap.release()
         return tracked_points
-    frame = cv2.resize(frame, resize_dim)
-    prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    frame1 = cv2.resize(frame1, resize_dim)
+    prev_gray = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+
+    prev_points = np.array(initial_points, dtype=np.float32).reshape(-1, 1, 2)
     tracked_points.append([tuple(pt[0]) for pt in prev_points])
 
     if visualize:
-        window_name = "Optical Flow Tracking"
+        window_name = "PWCNet Optical Flow Tracking"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, resize_dim[0], resize_dim[1])
 
     while True:
-        ret, frame = cap.read()
+        ret, frame2 = cap.read()
         if not ret:
             break
-        frame = cv2.resize(frame, resize_dim)
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        next_points, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray_frame, prev_points, None)
-        good_points = []
-        for i, st in enumerate(status):
-            if st[0] == 1:
-                good_points.append(next_points[i])
-            else:
-                good_points.append(prev_points[i])
-        prev_points = np.array(good_points, dtype=np.float32)
+
+        frame2 = cv2.resize(frame2, resize_dim)
+        next_gray = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+
+        # 计算光流
+        flow = pwc_net(torch.tensor(prev_gray).unsqueeze(0).unsqueeze(0).float(),
+                       torch.tensor(next_gray).unsqueeze(0).unsqueeze(0).float())
+        flow = flow.squeeze(0).detach().numpy().transpose(1, 2, 0)
+
+        # 更新点位置
+        new_points = []
+        for pt in prev_points:
+            x, y = int(pt[0][0]), int(pt[0][1])
+            dx, dy = flow[y, x]
+            new_x, new_y = x + dx, y + dy
+            new_points.append([[new_x, new_y]])
+
+        prev_points = np.array(new_points, dtype=np.float32)
         tracked_points.append([tuple(pt[0]) for pt in prev_points])
-        prev_gray = gray_frame.copy()
+        prev_gray = next_gray.copy()
 
         if visualize:
-            vis_frame = frame.copy()
+            vis_frame = frame2.copy()
             for pt in prev_points:
                 cv2.circle(vis_frame, (int(pt[0][0]), int(pt[0][1])), 3, (0, 255, 0), -1)
             cv2.imshow(window_name, vis_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+
     if visualize:
         cv2.destroyWindow(window_name)
+
     cap.release()
     return tracked_points
 
@@ -340,7 +358,7 @@ def main():
 
     # 第三步：利用光流跟踪，将校正后的4个点在整个视频中跟踪
     resize_dim = (orig_frame.shape[1], orig_frame.shape[0])
-    tracked_points = track_points(args.video_file, corrected_src_points, resize_dim, visualize=True)
+    tracked_points = track_points_pwcnet(args.video_file, corrected_src_points, resize_dim, visualize=True)
     print(f"Tracked points obtained on {len(tracked_points)} frames.")
 
     # 第四步：对跟踪轨迹进行平滑处理
@@ -350,7 +368,7 @@ def main():
 
     # 第五步：计算每一帧的 Homography，源点为第一帧校正后的点，目标点为平滑后的轨迹点
     homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_01.json")
+    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_01_pwc.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
