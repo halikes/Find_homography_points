@@ -47,7 +47,7 @@ def insertion_mouse_callback(event, x, y, flags, param):
 
 
 def interactive_insertion(video_file, object_file, resize_width, output_dir):
-    # 读取视频第一帧
+
     cap = cv2.VideoCapture(video_file)
     ret, first_frame = cap.read()
     if not ret:
@@ -55,14 +55,14 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         raise IOError("Cannot read video file: " + video_file)
     cap.release()
 
-    # Resize 第一帧
+    # Resize
     h0, w0 = first_frame.shape[:2]
     scale = resize_width / float(w0)
     first_frame = cv2.resize(first_frame, (resize_width, int(h0 * scale)))
     target_frame = first_frame.copy()
     orig_frame = first_frame.copy()
 
-    # 加载对象图像（转换为 BGR 格式）
+
     object_img = np.array(Image.open(object_file).convert('RGB'))
     object_img = cv2.cvtColor(object_img, cv2.COLOR_RGB2BGR)
 
@@ -99,7 +99,7 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         param['obj_pos'][0] = x
         param['obj_pos'][1] = y
 
-        # 融合对象图像到目标帧（直接覆盖）
+        # Draw object
         display_img[y:y + new_h, x:x + new_w] = cur_obj_img
         cv2.imshow(window_name, display_img)
         key = cv2.waitKey(20) & 0xFF
@@ -130,13 +130,11 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
     return fused_img, source_img, mask_img, final_params, orig_frame
 
 
-# ----------------------- SIFT+边缘校正与光流跟踪模块 -----------------------
-manual_points = []  # 用于存放用户点击的四个点
-
+# ----------------------- SIFT + tracking -----------------------
 
 def sift_mouse_click(event, x, y, flags, param):
     """
-    鼠标回调：手动选取点
+    user mouse click callback function for selecting points for homography
     """
     global manual_points
     if event == cv2.EVENT_LBUTTONDOWN and len(manual_points) < 4:
@@ -148,7 +146,7 @@ def sift_mouse_click(event, x, y, flags, param):
 
 def find_nearest_edge_point(point, edge_image):
     """
-    对于给定的点，在边缘图像中寻找最近的边缘点
+    find the nearest edge point to the given point
     """
     indices = np.argwhere(edge_image > 0)
     if len(indices) == 0:
@@ -161,8 +159,7 @@ def find_nearest_edge_point(point, edge_image):
 
 def select_and_correct_points(frame):
     """
-    在给定帧上，用户手动选取4个点，然后利用 Canny 边缘检测对这些点进行校正，
-    返回校正后的点列表。
+    select 4 points on the frame for homography computation
     """
     global manual_points
     manual_points = []
@@ -178,7 +175,7 @@ def select_and_correct_points(frame):
             break
     cv2.destroyWindow(window_name)
 
-    # 边缘检测
+    # edge detection
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     corrected_points = []
@@ -191,20 +188,32 @@ def select_and_correct_points(frame):
 
 def track_points(video_file, initial_points, resize_dim, visualize=False):
     """
-    利用光流跟踪，将初始的4个校正点在整个视频中跟踪，
-    返回一个列表，每个元素为当前帧跟踪到的4个点（格式：[(x,y), ...]）。
-    如果 visualize=True，则实时显示窗口“Optical Flow Tracking”。
+    使用 LK 光流跟踪给定初始点，并优化跟踪质量
     """
     cap = cv2.VideoCapture(video_file)
     tracked_points = []
     prev_points = np.array(initial_points, dtype=np.float32).reshape(-1, 1, 2)
+
+    # 读取第一帧
     ret, frame = cap.read()
     if not ret:
         cap.release()
         return tracked_points
+
     frame = cv2.resize(frame, resize_dim)
     prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # 对比度增强
+    prev_gray = cv2.equalizeHist(prev_gray)
+
     tracked_points.append([tuple(pt[0]) for pt in prev_points])
+
+    # 光流参数优化
+    lk_params = dict(
+        winSize=(21, 21),  # 增大窗口大小，提高跟踪稳定性
+        maxLevel=3,  # 使用 3 级金字塔，提高对大运动的适应性
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)  # 提高迭代精度
+    )
 
     if visualize:
         window_name = "Optical Flow Tracking"
@@ -215,48 +224,86 @@ def track_points(video_file, initial_points, resize_dim, visualize=False):
         ret, frame = cap.read()
         if not ret:
             break
+
         frame = cv2.resize(frame, resize_dim)
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        next_points, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray_frame, prev_points, None)
-        good_points = []
-        for i, st in enumerate(status):
-            if st[0] == 1:
-                good_points.append(next_points[i])
-            else:
-                good_points.append(prev_points[i])
+        gray_frame = cv2.equalizeHist(gray_frame)  # 对比度增强
+
+        # 计算光流
+        next_points, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_frame, prev_points, None, **lk_params)
+
+        # 反向光流检查，提高跟踪质量
+        back_points, status_back, _ = cv2.calcOpticalFlowPyrLK(gray_frame, prev_gray, next_points, None, **lk_params)
+        fb_dist = np.linalg.norm(prev_points - back_points, axis=2).reshape(-1)
+
+        # 过滤掉误匹配的点
+        valid_idx = (status.flatten() == 1) & (status_back.flatten() == 1) & (fb_dist < 1.0)
+        good_points = prev_points.copy()
+        good_points[valid_idx] = next_points[valid_idx]
+
         prev_points = np.array(good_points, dtype=np.float32)
+
         tracked_points.append([tuple(pt[0]) for pt in prev_points])
         prev_gray = gray_frame.copy()
 
         if visualize:
             vis_frame = frame.copy()
             for pt in prev_points:
-                cv2.circle(vis_frame, (int(pt[0][0]), int(pt[0][1])), 1, (0, 255, 0), -1)
+                cv2.circle(vis_frame, (int(pt[0][0]), int(pt[0][1])), 2, (0, 255, 0), -1)
             cv2.imshow(window_name, vis_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+
     if visualize:
         cv2.destroyWindow(window_name)
     cap.release()
     return tracked_points
 
 
-def smooth_trajectories(tracked_points, window_length=21, polyorder=2):
+def analyze_motion_consistency(tracked_points):
     """
-    对每个选点的轨迹进行 Savitzky-Golay 平滑，返回平滑后的轨迹列表。
-    tracked_points：list，每个元素为一帧跟踪到的4个点（格式：[(x,y), ...]）
-    返回：list，每个元素为平滑后的4个点
+    分析每个点在相邻帧之间的位移变化，判断运动是否一致。
+    如果某个点偏离整体趋势，则用其他点的平均值进行修正。
     """
     num_frames = len(tracked_points)
     num_points = len(tracked_points[0])
-    # 转换为 numpy 数组：形状 (num_frames, num_points, 2)
+    
+    corrected_points = np.array(tracked_points, dtype=np.float32)
+
+    for t in range(1, num_frames):  # 从第二帧开始
+        prev_pts = corrected_points[t - 1]  # 之前帧的点
+        curr_pts = corrected_points[t]      # 当前帧的点
+        
+        # 计算位移向量
+        displacements = curr_pts - prev_pts  # 每个点的位移
+        mean_disp = np.mean(displacements, axis=0)  # 计算所有点的平均位移
+
+        # 计算每个点的位移与均值的差距
+        diffs = np.linalg.norm(displacements - mean_disp, axis=1)
+
+        # 设定阈值（例如超过均值偏差的1.5倍）
+        threshold = np.mean(diffs) + 1.5 * np.std(diffs)
+
+        # 发现异常点
+        for i in range(num_points):
+            if diffs[i] > threshold:
+                print(f"Frame {t}: Point {i} is inconsistent, correcting...")
+                corrected_points[t, i] = prev_pts[i] + mean_disp  # 用均值位移修正
+
+    return corrected_points
+
+
+def smooth_trajectories(tracked_points, window_length=21, polyorder=2):
+
+    num_frames = len(tracked_points)
+    num_points = len(tracked_points[0])
+
     traj = np.array(tracked_points)
     smoothed = np.zeros_like(traj)
-    # 对每个点独立平滑 x 和 y 坐标
+    
     for i in range(num_points):
         x_coords = traj[:, i, 0]
         y_coords = traj[:, i, 1]
-        # 调整窗口长度：必须为奇数且不超过数据长度
         win_len = window_length if window_length <= len(x_coords) and window_length % 2 == 1 else (len(x_coords) // 2) * 2 + 1
         smooth_x = savgol_filter(x_coords, window_length=win_len, polyorder=polyorder)
         smooth_y = savgol_filter(y_coords, window_length=win_len, polyorder=polyorder)
@@ -266,14 +313,11 @@ def smooth_trajectories(tracked_points, window_length=21, polyorder=2):
 
 
 def plot_trajectories(original_traj, smoothed_traj):
-    """
-    original_traj: list，每个元素为一帧跟踪到的4个点，格式为 [(x,y), (x,y), (x,y), (x,y)]
-    smoothed_traj: numpy数组，形状 (num_frames, 4, 2)，表示平滑后的轨迹
-    """
+    
     num_frames = len(original_traj)
     num_points = len(original_traj[0])
 
-    # 将原始轨迹转换为 numpy 数组，形状 (num_frames, num_points, 2)
+    
     orig_array = np.array(original_traj)
 
     plt.figure(figsize=(15, 15))
@@ -285,10 +329,10 @@ def plot_trajectories(original_traj, smoothed_traj):
         # 提取第 i 个点的平滑轨迹 (num_frames, 2)
         smooth_points = smoothed_traj[:, i, :]
 
-        # 绘制平滑轨迹（用方块虚线连线）
+        # 绘制平滑轨迹
         plt.plot(smooth_points[:, 0], smooth_points[:, 1], 's--', color=colors[i], alpha=0.5,
                  label=f"Smoothed Point {i + 1}")
-        # 绘制原始轨迹（用圆点连线，颜色稍透明）
+        # 绘制原始轨迹
         plt.plot(orig_points[:, 0], orig_points[:, 1], 'o-', color= 'gray',
                  label=f"Original Point {i + 1}")
 
@@ -339,10 +383,12 @@ def main():
     tracked_points = track_points(args.video_file, corrected_src_points, resize_dim, visualize=True)
     print(f"Tracked points obtained on {len(tracked_points)} frames.")
 
-    # 第四步：对跟踪轨迹进行平滑处理
-    smoothed_traj = smooth_trajectories(tracked_points, window_length=21, polyorder=2)
-    # 可视化平滑后的轨迹
-    plot_trajectories(tracked_points, smoothed_traj)
+    # 第四步：分析运动一致性
+    consistent_tracked_points = analyze_motion_consistency(tracked_points)
+
+    # 第五步：对平滑后的轨迹进行处理
+    smoothed_traj = smooth_trajectories(consistent_tracked_points, window_length=21, polyorder=2)
+    plot_trajectories(consistent_tracked_points, smoothed_traj)
 
     # 第五步：计算每一帧的 Homography，源点为第一帧校正后的点，目标点为平滑后的轨迹点
     homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)

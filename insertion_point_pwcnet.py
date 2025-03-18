@@ -14,7 +14,7 @@ from model.PWC_src.pwc import PWC_Net
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video_001.mp4', help='Path to target video')
+parser.add_argument('--video_file', type=str, default='data/Zoom_IN_OUT.mp4', help='Path to target video')
 parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
