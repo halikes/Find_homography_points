@@ -4,19 +4,15 @@ import numpy as np
 import argparse
 import os
 import json
-import logging
 from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
-# 设置日志
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video_002.mp4', help='Path to target video')
+parser.add_argument('--video_file', type=str, default='data/sample_video_005.mp4', help='Path to target video')
 parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
@@ -28,20 +24,23 @@ def nothing(x):
     pass
 
 def insertion_mouse_callback(event, x, y, flags, param):
-    # 利用回调函数调整对象插入位置
+    # 用于交互式调整插入位置和大小
+    global mouse_coord
+    mouse_coord = (x, y)
+    (ox, oy, ow, oh) = param['obj_bbox']
     if event == cv2.EVENT_LBUTTONDOWN:
-        if param['obj_bbox'][0] <= x <= param['obj_bbox'][0] + param['obj_bbox'][2] and \
-           param['obj_bbox'][1] <= y <= param['obj_bbox'][1] + param['obj_bbox'][3]:
+        if ox <= x <= ox + ow and oy <= y <= oy + oh:
             param['dragging'] = True
-            param['drag_offset'] = [x - param['obj_bbox'][0], y - param['obj_bbox'][1]]
+            param['drag_offset'] = [x - ox, y - oy]
     elif event == cv2.EVENT_MOUSEMOVE:
         if param.get('dragging', False):
             dx, dy = param['drag_offset']
-            param['obj_pos'] = [x - dx, y - dy]
+            param['obj_pos'][0] = x - dx
+            param['obj_pos'][1] = y - dy
     elif event == cv2.EVENT_LBUTTONUP:
         param['dragging'] = False
 
-def interactive_insertion(video_file, object_file, resize_width):
+def interactive_insertion(video_file, object_file, resize_width, output_dir):
     # 读取视频第一帧
     cap = cv2.VideoCapture(video_file)
     ret, first_frame = cap.read()
@@ -57,14 +56,15 @@ def interactive_insertion(video_file, object_file, resize_width):
     target_frame = first_frame.copy()
     orig_frame = first_frame.copy()
 
-    # 加载对象图像并转换为 BGR 格式
+    # 加载对象图像（转换为 BGR 格式）
     object_img = np.array(Image.open(object_file).convert('RGB'))
     object_img = cv2.cvtColor(object_img, cv2.COLOR_RGB2BGR)
+
     orig_obj_h, orig_obj_w = object_img.shape[:2]
-    
-    # 初始对象位置与比例
     obj_pos = [50, 50]
+    global scale_factor
     scale_factor = 1.0
+
     param = {
         'obj_pos': obj_pos,
         'obj_bbox': (obj_pos[0], obj_pos[1], orig_obj_w, orig_obj_h),
@@ -90,22 +90,25 @@ def interactive_insertion(video_file, object_file, resize_width):
         H_disp, W_disp = display_img.shape[:2]
         x = max(0, min(x, W_disp - new_w))
         y = max(0, min(y, H_disp - new_h))
-        param['obj_pos'] = [x, y]
+        param['obj_pos'][0] = x
+        param['obj_pos'][1] = y
 
-        # 将对象图像直接覆盖到目标帧
+        # 融合对象图像到目标帧（直接覆盖）
         display_img[y:y + new_h, x:x + new_w] = cur_obj_img
         cv2.imshow(window_name, display_img)
-        if cv2.waitKey(20) & 0xFF == 27:
+        key = cv2.waitKey(20) & 0xFF
+        if key == 27:
             break
     cv2.destroyAllWindows()
 
     fused_img = display_img.copy()
-    # 构造 source_img 与 mask_img
+
+    # source_img
     source_img = np.zeros_like(fused_img)
     source_img[y:y + new_h, x:x + new_w] = cur_obj_img
     roi = source_img[y:y + new_h, x:x + new_w]
     roi_smoothed = cv2.bilateralFilter(roi, d=5, sigmaColor=75, sigmaSpace=75)
-    source_img[y:y + new_h, x:x + new_w] = roi_smoothed
+    source_img[y:y + new_h, x:x + new_w] = roi_smoothed  # 注意这里确保区域尺寸一致
     mask_img = source_img.copy()
     mask_img[mask_img > 0] = 255
 
@@ -114,21 +117,22 @@ def interactive_insertion(video_file, object_file, resize_width):
         "scale": scale_factor,
         "object_size": {"w": new_w, "h": new_h}
     }
-    cv2.imwrite(os.path.join(args.output_dir, "source_img_sample_video_02.png"), source_img)
-    cv2.imwrite(os.path.join(args.output_dir, "mask_img_sample_video_02.png"), mask_img)
+
+    cv2.imwrite(os.path.join(output_dir, "source_img_sample_video_05.png"), source_img)
+    cv2.imwrite(os.path.join(output_dir, "mask_img_sample_video_05.png"), mask_img)
 
     return fused_img, source_img, mask_img, final_params, orig_frame
 
 # ----------------------- SIFT+边缘校正模块 -----------------------
-manual_points = []  # 避免全局变量，实际应用中建议封装为类
+manual_points = []  # 用于存放用户点击的四个点
 
 def sift_mouse_click(event, x, y, flags, param):
     global manual_points
     if event == cv2.EVENT_LBUTTONDOWN and len(manual_points) < 4:
         manual_points.append((x, y))
-        logging.info(f"Selected point {len(manual_points)}: ({x}, {y})")
+        print(f"Selected point {len(manual_points)}: ({x}, {y})")
         if len(manual_points) == 4:
-            logging.info("4 points selected. Press any key to proceed.")
+            print("4 points selected. Press any key to proceed.")
 
 def find_nearest_edge_point(point, edge_image):
     indices = np.argwhere(edge_image > 0)
@@ -159,19 +163,21 @@ def select_and_correct_points(frame):
     for pt in manual_points:
         cp = find_nearest_edge_point(pt, edges)
         corrected_points.append(cp)
-        logging.info(f"Original: {pt}, Corrected: {cp}")
+        print(f"Original: {pt}, Corrected: {cp}")
     return corrected_points
 
 # ----------------------- 光流区域跟踪模块 -----------------------
 def flow_to_color(flow, multiplier=50):
     """
-    将光流（H, W, 2）转换为颜色编码图像，
-    multiplier 用于调节幅值映射
+    将光流（H, W, 2）转换为颜色编码的BGR图像用于可视化，
+    使用HSV映射：角度对应色调，幅值对应亮度。
+    multiplier 参数用于调节幅值到亮度的映射倍率
     """
     h, w = flow.shape[:2]
     hsv = np.zeros((h, w, 3), dtype=np.uint8)
+    # 计算幅值和角度
     mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-    logging.info(f"Flow magnitude: min = {mag.min()}, max = {mag.max()}")
+    print("Flow magnitude: min =", mag.min(), ", max =", mag.max())  # 调试输出
     hsv[..., 0] = ang * 180 / np.pi / 2
     hsv[..., 1] = 255
     hsv[..., 2] = np.clip(mag * multiplier, 0, 255)
@@ -180,14 +186,21 @@ def flow_to_color(flow, multiplier=50):
 
 def track_region_dense(video_file, region_points, resize_dim, visualize=False):
     """
-    利用 RAFT 计算密集光流，
-      1. 根据用户标记的四个点构成区域，生成多边形掩码；
-      2. 从区域内光流中提取中位数位移；
-      3. 对位移进行平滑与剪裁后更新区域角点；
-      4. 保存每帧的光流颜色图供调试。
+    利用 RAFT 模型计算密集光流，对每一帧执行如下步骤：
+      1. 从前后帧计算密集光流，确保输入图像归一化；
+      2. 根据当前区域角点（由用户标记的4个点构成的多边形）生成掩码，
+         并提取该区域内所有像素的原始位置（(x,y)）和更新后位置（x+flow, y+flow）；
+      3. 利用 RANSAC 拟合仿射变换，从而获得一个变换矩阵 T，使得 T 能最好描述区域内整体运动；
+      4. 使用变换矩阵 T 更新区域的四个角点；
+      5. 如果 RANSAC 拟合失败，则退回采用区域内像素中位数位移更新；
+      6. 保存每帧的光流颜色图用于调试，并返回每帧更新后的区域角点。
     """
-    motion_threshold = 0.5  # 低于此值认为无明显运动
+    # 参数设置
+    motion_threshold = 0.1   # 位移低于此值视为无运动
+    disp_clip = 10.0         # 剪裁最大位移，单位：像素
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 加载 RAFT 模型
     RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
     RAFT = RAFT.eval()
 
@@ -200,10 +213,11 @@ def track_region_dense(video_file, region_points, resize_dim, visualize=False):
     frame1 = cv2.resize(frame1, resize_dim)
     prev_frame = frame1.copy()
 
-    # 初始化区域角点
-    region_pts = np.array(region_points, dtype=np.float32)  # shape (4, 2)
+    # 初始化区域角点（4个点，格式为 (4,2) 的 numpy 数组）
+    region_pts = np.array(region_points, dtype=np.float32)
     tracked_regions.append(region_pts.tolist())
 
+    # 创建调试目录保存光流颜色图
     debug_dir = os.path.join(args.output_dir, "flow_debug")
     os.makedirs(debug_dir, exist_ok=True)
 
@@ -213,59 +227,71 @@ def track_region_dense(video_file, region_points, resize_dim, visualize=False):
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, resize_dim[0], resize_dim[1])
 
-    # 对位移进行简单平滑处理（后续可考虑指数平滑等）
-    prev_disp = np.array([0, 0], dtype=np.float32)
-
     while True:
         ret, frame2 = cap.read()
         if not ret:
             break
         frame2 = cv2.resize(frame2, resize_dim)
-        
+
+        # 将前后帧转换为 float32 并归一化，然后构造 (B,C,H,W) 的 tensor
         prev_tensor = torch.tensor(prev_frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
         next_tensor = torch.tensor(frame2, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
         prev_tensor = prev_tensor.to(device)
         next_tensor = next_tensor.to(device)
-        
+
         with torch.no_grad():
             flows = RAFT(prev_tensor, next_tensor)
             flow = flows[-1]
+        # 调整为 (H, W, 2) 的 numpy 数组
         flow = flow.squeeze(0).detach().cpu().numpy().transpose(1, 2, 0)
 
-        # 保存光流调试图像
+        # 保存当前帧光流颜色图，便于调试
         flow_color = flow_to_color(flow, multiplier=50)
         cv2.imwrite(os.path.join(debug_dir, f"flow_frame_{frame_idx:04d}.png"), flow_color)
 
-        # 生成区域掩码
+        # 生成多边形掩码（区域由 region_pts 构成）
         mask = np.zeros((resize_dim[1], resize_dim[0]), dtype=np.uint8)
         pts = region_pts.reshape((-1, 1, 2)).astype(np.int32)
         cv2.fillPoly(mask, [pts], 255)
-        region_flow = flow[mask == 255]
-        if region_flow.size == 0:
-            current_disp = np.array([0, 0], dtype=np.float32)
+
+        # 提取区域内所有像素的坐标，np.where 返回 (row, col)
+        rows, cols = np.where(mask == 255)
+        if len(rows) == 0:
+            updated_transform = None
         else:
-            current_disp = np.median(region_flow, axis=0)
+            # 原始坐标，转换为 (x, y) 格式
+            orig_coords = np.stack([cols, rows], axis=1).astype(np.float32)  # shape (N,2)
+            # 对应的光流向量
+            flow_vectors = flow[rows, cols, :]  # shape (N,2)
+            # 更新后坐标 = 原始坐标 + 光流向量
+            new_coords = orig_coords + flow_vectors
 
-        # 对位移进行剪裁（异常值处理）
-        norm_disp = np.linalg.norm(current_disp)
-        disp_clip = 5.0
-        if norm_disp > disp_clip:
-            current_disp = current_disp / norm_disp * disp_clip
+            # 对区域内所有像素利用 RANSAC 拟合仿射变换 T，使得 T(orig_coords) ≈ new_coords
+            affine_matrix, inliers = cv2.estimateAffinePartial2D(orig_coords, new_coords, method=cv2.RANSAC, ransacReprojThreshold=5)
+            updated_transform = affine_matrix if affine_matrix is not None else None
 
-        if np.linalg.norm(current_disp) < motion_threshold:
-            logging.info(f"Frame {frame_idx}: displacement {current_disp} below threshold, no update")
-            current_disp = np.array([0, 0], dtype=np.float32)
+        if updated_transform is not None:
+            # 对区域角点应用拟合得到的仿射变换
+            ones = np.ones((region_pts.shape[0], 1), dtype=np.float32)
+            region_pts_hom = np.hstack([region_pts, ones])  # (4,3)
+            updated_region_pts = (updated_transform @ region_pts_hom.T).T  # (4,2)
+            region_pts = updated_region_pts
+            print(f"Frame {frame_idx}: Updated region using affine transform.")
         else:
-            logging.info(f"Frame {frame_idx}: raw displacement = {current_disp}")
-
-        # 简单平滑：平均上一次与本帧位移
-        smoothed_disp = 0.6 * current_disp + 0.4 * prev_disp
-        prev_disp = smoothed_disp.copy()
-        logging.info(f"Frame {frame_idx}: smoothed displacement = {smoothed_disp}")
-
-        region_pts = region_pts + smoothed_disp
+            # 如果拟合失败，则退回到使用区域内像素的中位数位移更新
+            if len(rows) > 0:
+                current_disp = np.median(flow[mask == 255], axis=0)
+                norm_disp = np.linalg.norm(current_disp)
+                if norm_disp > disp_clip:
+                    current_disp = current_disp / norm_disp * disp_clip
+                if np.linalg.norm(current_disp) < motion_threshold:
+                    current_disp = np.array([0, 0], dtype=np.float32)
+                region_pts = region_pts + current_disp
+                print(f"Frame {frame_idx}: Fallback update with median displacement {current_disp}.")
+            else:
+                print(f"Frame {frame_idx}: No valid pixels in region.")
+        
         tracked_regions.append(region_pts.tolist())
-
         prev_frame = frame2.copy()
         frame_idx += 1
         
@@ -276,12 +302,15 @@ def track_region_dense(video_file, region_points, resize_dim, visualize=False):
             cv2.imshow(window_name, vis_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
+        
     cap.release()
     if visualize:
         cv2.destroyAllWindows()
     return tracked_regions
 
+
+
+# ----------------------- 轨迹平滑与可视化 -----------------------
 def smooth_trajectories(tracked_points, window_length=15, polyorder=2):
     num_frames = len(tracked_points)
     num_points = len(tracked_points[0])
@@ -329,30 +358,32 @@ def compute_homography_for_frames(src_points, smoothed_traj):
         homography_results.append({"frame_idx": idx, "homography_matrix": H.tolist()})
     return homography_results
 
+# ----------------------- 主程序 -----------------------
 def main():
-    logging.info("Starting interactive insertion...")
+    print("Starting interactive insertion...")
     fused_img, source_img, mask_img, ins_params, orig_frame = interactive_insertion(
-        args.video_file, args.object_file, args.resize_width)
+        args.video_file, args.object_file, args.resize_width, args.output_dir)
     cv2.imshow("Final Insertion", fused_img)
     cv2.waitKey(2000)
     cv2.destroyAllWindows()
 
-    logging.info("Now select 4 points for global Homography computation on the original frame...")
+    print("Now select 4 points for global Homography computation on the original frame...")
     corrected_src_points = select_and_correct_points(orig_frame)
-    logging.info(f"Corrected source points: {corrected_src_points}")
+    print("Corrected source points:", corrected_src_points)
 
+    # 使用用户选取的区域作为初始区域
     resize_dim = (orig_frame.shape[1], orig_frame.shape[0])
     tracked_regions = track_region_dense(args.video_file, corrected_src_points, resize_dim, visualize=True)
-    logging.info(f"Tracked regions obtained on {len(tracked_regions)} frames.")
+    print(f"Tracked regions obtained on {len(tracked_regions)} frames.")
 
     smoothed_traj = smooth_trajectories(tracked_regions, window_length=15, polyorder=2)
     plot_trajectories(tracked_regions, smoothed_traj)
 
     homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_02_raft.json")
+    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_05_raft.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
-    logging.info("Homography results saved to " + homography_json)
+    print("Homography results saved to", homography_json)
 
 if __name__ == "__main__":
     main()

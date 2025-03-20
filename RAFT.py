@@ -12,7 +12,7 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video_001.mp4', help='Path to target video')
+parser.add_argument('--video_file', type=str, default='data/sample_video_005.mp4', help='Path to target video')
 parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
@@ -118,8 +118,8 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         "object_size": {"w": new_w, "h": new_h}
     }
 
-    cv2.imwrite(os.path.join(output_dir, "source_img_sample_video_01.png"), source_img)
-    cv2.imwrite(os.path.join(output_dir, "mask_img_sample_video_01.png"), mask_img)
+    cv2.imwrite(os.path.join(output_dir, "source_img_sample_video_05.png"), source_img)
+    cv2.imwrite(os.path.join(output_dir, "mask_img_sample_video_05.png"), mask_img)
 
     return fused_img, source_img, mask_img, final_params, orig_frame
 
@@ -193,7 +193,7 @@ def track_region_dense(video_file, region_points, resize_dim, visualize=False):
       4. 否则，将该位移更新到区域的四个角点；
       5. 保存每帧的光流颜色图，便于调试。
     """
-    motion_threshold = 0.5  # 如果中位数位移低于该阈值，则认为区域静止
+    motion_threshold = 0.1  # 如果中位数位移低于该阈值，则认为区域静止
     device = "cuda" if torch.cuda.is_available() else "cpu"
     RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
     RAFT = RAFT.eval()
@@ -350,7 +350,7 @@ def main():
     plot_trajectories(tracked_regions, smoothed_traj)
 
     homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_01_raft.json")
+    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_05_raft.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
