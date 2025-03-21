@@ -13,7 +13,7 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
 parser.add_argument('--video_file', type=str, default='data/sample_video_005.mp4', help='Path to target video')
-parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
+parser.add_argument('--object_file', type=str, default='data/source_flower.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
 args = parser.parse_args()
@@ -107,8 +107,7 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
     source_img = np.zeros_like(fused_img)
     source_img[y:y + new_h, x:x + new_w] = cur_obj_img
     roi = source_img[y:y + new_h, x:x + new_w]
-    roi_smoothed = cv2.bilateralFilter(roi, d=5, sigmaColor=75, sigmaSpace=75)
-    source_img[y:y + new_h, x:x + new_w] = roi_smoothed  # 注意这里确保区域尺寸一致
+    source_img[y:y + new_h, x:x + new_w] = roi  # 注意这里确保区域尺寸一致
     mask_img = source_img.copy()
     mask_img[mask_img > 0] = 255
 
@@ -167,138 +166,112 @@ def select_and_correct_points(frame):
     return corrected_points
 
 # ----------------------- 光流区域跟踪模块 -----------------------
-def flow_to_color(flow, multiplier=50):
+def sample_flow_weighted(flow, x, y, window_size=5, sigma=1.0):
     """
-    将光流（H, W, 2）转换为颜色编码的BGR图像用于可视化，
-    使用HSV映射：角度对应色调，幅值对应亮度。
-    multiplier 参数用于调节幅值到亮度的映射倍率
+    对光流场在 (x, y) 处，以 window_size 为窗口进行加权平均采样，
+    使用高斯权重，sigma 为标准差，返回加权平均的光流向量。
     """
-    h, w = flow.shape[:2]
-    hsv = np.zeros((h, w, 3), dtype=np.uint8)
-    # 计算幅值和角度
-    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-    print("Flow magnitude: min =", mag.min(), ", max =", mag.max())  # 调试输出
-    hsv[..., 0] = ang * 180 / np.pi / 2
-    hsv[..., 1] = 255
-    hsv[..., 2] = np.clip(mag * multiplier, 0, 255)
-    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    return bgr
+    half = window_size // 2
+    h, w, _ = flow.shape
+    flows = []
+    weights = []
+    for dy in range(-half, half+1):
+        for dx in range(-half, half+1):
+            xi = int(np.clip(x + dx, 0, w - 1))
+            yi = int(np.clip(y + dy, 0, h - 1))
+            flows.append(flow[yi, xi])
+            weight = np.exp(-((dx**2 + dy**2) / (2 * sigma**2)))
+            weights.append(weight)
+    flows = np.array(flows)
+    weights = np.array(weights)
+    weighted_flow = np.sum(flows * weights[:, None], axis=0) / np.sum(weights)
+    return weighted_flow
 
-def track_region_dense(video_file, region_points, resize_dim, visualize=False):
+def track_points_with_raft(video_file, points, resize_dim, visualize=False, alpha=1):
     """
-    利用 RAFT 模型计算密集光流，对每一帧执行如下步骤：
-      1. 从前后帧计算密集光流，确保输入图像归一化；
-      2. 根据当前区域角点（由用户标记的4个点构成的多边形）生成掩码，
-         并提取该区域内所有像素的原始位置（(x,y)）和更新后位置（x+flow, y+flow）；
-      3. 利用 RANSAC 拟合仿射变换，从而获得一个变换矩阵 T，使得 T 能最好描述区域内整体运动；
-      4. 使用变换矩阵 T 更新区域的四个角点；
-      5. 如果 RANSAC 拟合失败，则退回采用区域内像素中位数位移更新；
-      6. 保存每帧的光流颜色图用于调试，并返回每帧更新后的区域角点。
+    利用 RAFT 模型计算密集光流，对用户标记的 4 个点逐点更新：
+      1. 每一帧将前后帧转换为 float32 并归一化；
+      2. 对于每个点，采用加权局部窗口采样得到像素级光流向量；
+      3. 对采样得到的位移进行剪裁（防止异常大值）；
+      4. 采用指数平滑更新点位置：new_point = alpha*(pt + flow) + (1-alpha)*prev_point；
+      5. 保存每帧跟踪的点坐标。
     """
-    # 参数设置
-    motion_threshold = 0.1   # 位移低于此值视为无运动
-    disp_clip = 10.0         # 剪裁最大位移，单位：像素
+    max_disp = 10.0  # 最大允许位移
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    
     # 加载 RAFT 模型
     RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
     RAFT = RAFT.eval()
-
+    
     cap = cv2.VideoCapture(video_file)
-    tracked_regions = []
+    tracked_points = []
+    
+    # 读取第一帧
     ret, frame1 = cap.read()
     if not ret:
         cap.release()
-        return tracked_regions
+        return tracked_points
     frame1 = cv2.resize(frame1, resize_dim)
     prev_frame = frame1.copy()
-
-    # 初始化区域角点（4个点，格式为 (4,2) 的 numpy 数组）
-    region_pts = np.array(region_points, dtype=np.float32)
-    tracked_regions.append(region_pts.tolist())
-
-    # 创建调试目录保存光流颜色图
-    debug_dir = os.path.join(args.output_dir, "flow_debug")
-    os.makedirs(debug_dir, exist_ok=True)
-
+    
+    # 初始化点（格式为 (4,2)）
+    points = np.array(points, dtype=np.float32)
+    tracked_points.append(points.tolist())
+    prev_points = points.copy()
+    
     frame_idx = 0
     if visualize:
-        window_name = "Region Tracking"
+        window_name = "Point Tracking"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, resize_dim[0], resize_dim[1])
-
+    
     while True:
         ret, frame2 = cap.read()
         if not ret:
             break
         frame2 = cv2.resize(frame2, resize_dim)
-
-        # 将前后帧转换为 float32 并归一化，然后构造 (B,C,H,W) 的 tensor
-        prev_tensor = torch.tensor(prev_frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
-        next_tensor = torch.tensor(frame2, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
+        
+        # 前后帧转换为 float32, 归一化, 转换为 (B,C,H,W)
+        prev_tensor = torch.tensor(prev_frame, dtype=torch.float32).permute(2,0,1).unsqueeze(0) / 255.0
+        next_tensor = torch.tensor(frame2, dtype=torch.float32).permute(2,0,1).unsqueeze(0) / 255.0
         prev_tensor = prev_tensor.to(device)
         next_tensor = next_tensor.to(device)
-
+        
         with torch.no_grad():
             flows = RAFT(prev_tensor, next_tensor)
             flow = flows[-1]
-        # 调整为 (H, W, 2) 的 numpy 数组
-        flow = flow.squeeze(0).detach().cpu().numpy().transpose(1, 2, 0)
-
-        # 保存当前帧光流颜色图，便于调试
-        flow_color = flow_to_color(flow, multiplier=50)
-        cv2.imwrite(os.path.join(debug_dir, f"flow_frame_{frame_idx:04d}.png"), flow_color)
-
-        # 生成多边形掩码（区域由 region_pts 构成）
-        mask = np.zeros((resize_dim[1], resize_dim[0]), dtype=np.uint8)
-        pts = region_pts.reshape((-1, 1, 2)).astype(np.int32)
-        cv2.fillPoly(mask, [pts], 255)
-
-        # 提取区域内所有像素的坐标，np.where 返回 (row, col)
-        rows, cols = np.where(mask == 255)
-        if len(rows) == 0:
-            updated_transform = None
-        else:
-            # 原始坐标，转换为 (x, y) 格式
-            orig_coords = np.stack([cols, rows], axis=1).astype(np.float32)  # shape (N,2)
-            # 对应的光流向量
-            flow_vectors = flow[rows, cols, :]  # shape (N,2)
-            # 更新后坐标 = 原始坐标 + 光流向量
-            new_coords = orig_coords + flow_vectors
-
-            # 对区域内所有像素利用 RANSAC 拟合仿射变换 T，使得 T(orig_coords) ≈ new_coords
-            affine_matrix, inliers = cv2.estimateAffinePartial2D(orig_coords, new_coords, method=cv2.RANSAC, ransacReprojThreshold=5)
-            updated_transform = affine_matrix if affine_matrix is not None else None
-
-        if updated_transform is not None:
-            # 对区域角点应用拟合得到的仿射变换
-            ones = np.ones((region_pts.shape[0], 1), dtype=np.float32)
-            region_pts_hom = np.hstack([region_pts, ones])  # (4,3)
-            updated_region_pts = (updated_transform @ region_pts_hom.T).T  # (4,2)
-            region_pts = updated_region_pts
-            print(f"Frame {frame_idx}: Updated region using affine transform.")
-        else:
-            # 如果拟合失败，则退回到使用区域内像素的中位数位移更新
-            if len(rows) > 0:
-                current_disp = np.median(flow[mask == 255], axis=0)
-                norm_disp = np.linalg.norm(current_disp)
-                if norm_disp > disp_clip:
-                    current_disp = current_disp / norm_disp * disp_clip
-                if np.linalg.norm(current_disp) < motion_threshold:
-                    current_disp = np.array([0, 0], dtype=np.float32)
-                region_pts = region_pts + current_disp
-                print(f"Frame {frame_idx}: Fallback update with median displacement {current_disp}.")
-            else:
-                print(f"Frame {frame_idx}: No valid pixels in region.")
+        # 转换为 (H,W,2) numpy 数组
+        flow = flow.squeeze(0).detach().cpu().numpy().transpose(1,2,0)
         
-        tracked_regions.append(region_pts.tolist())
+        # 输出调试信息
+        flow_mag = np.linalg.norm(flow, axis=2)
+        print(f"Frame {frame_idx}: flow magnitude range: {flow_mag.min()} to {flow_mag.max()}")
+        
+        new_points = []
+        # 对每个点进行逐点更新
+        for pt in points:
+            x, y = pt
+            disp = sample_flow_weighted(flow, x, y, window_size=5, sigma=1.0)
+            norm_disp = np.linalg.norm(disp)
+            if norm_disp > max_disp:
+                disp = disp / norm_disp * max_disp
+            # 指数平滑更新：新点 = alpha*(当前点 + disp) + (1-alpha)*上一帧点
+            new_pt = alpha * (pt + disp) + (1 - alpha) * prev_points[np.where(points==pt)[0][0]]
+            new_points.append(new_pt)
+        new_points = np.array(new_points, dtype=np.float32)
+        
+        # 更新点记录
+        prev_points = new_points.copy()
+        points = new_points.copy()
+        tracked_points.append(points.tolist())
+        
         prev_frame = frame2.copy()
         frame_idx += 1
         
         if visualize:
             vis_frame = frame2.copy()
-            pts_draw = region_pts.reshape((-1, 1, 2)).astype(np.int32)
-            cv2.polylines(vis_frame, [pts_draw], isClosed=True, color=(0, 255, 0), thickness=2)
+            for pt in points:
+                cv2.circle(vis_frame, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
             cv2.imshow(window_name, vis_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -306,8 +279,22 @@ def track_region_dense(video_file, region_points, resize_dim, visualize=False):
     cap.release()
     if visualize:
         cv2.destroyAllWindows()
-    return tracked_regions
+    return tracked_points
 
+def flow_to_color(flow, multiplier=50):
+    """
+    将光流（H,W,2）转换为颜色编码的 BGR 图像，
+    利用 HSV 映射：角度对应色相，幅值对应亮度。
+    """
+    h, w = flow.shape[:2]
+    hsv = np.zeros((h,w,3), dtype=np.uint8)
+    mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+    print("Flow magnitude: min =", mag.min(), ", max =", mag.max())
+    hsv[...,0] = ang * 180 / np.pi / 2
+    hsv[...,1] = 255
+    hsv[...,2] = np.clip(mag * multiplier, 0, 255)
+    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    return bgr
 
 
 # ----------------------- 轨迹平滑与可视化 -----------------------
@@ -373,7 +360,7 @@ def main():
 
     # 使用用户选取的区域作为初始区域
     resize_dim = (orig_frame.shape[1], orig_frame.shape[0])
-    tracked_regions = track_region_dense(args.video_file, corrected_src_points, resize_dim, visualize=True)
+    tracked_regions = track_points_with_raft(args.video_file, corrected_src_points, resize_dim, visualize=True)
     print(f"Tracked regions obtained on {len(tracked_regions)} frames.")
 
     smoothed_traj = smooth_trajectories(tracked_regions, window_length=15, polyorder=2)
