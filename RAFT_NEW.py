@@ -19,12 +19,28 @@ parser.add_argument('--resize_width', type=int, default=512, help='Width to resi
 args = parser.parse_args()
 os.makedirs(args.output_dir, exist_ok=True)
 
+# ----------------------- 纹理增强模块 -----------------------
+def enhance_texture(frame):
+    """
+    对输入BGR图像进行纹理增强：
+      1. 将图像转换为Lab空间；
+      2. 对L通道采用CLAHE增强；
+      3. 合并通道转换回BGR；
+      4. 可选：进行锐化处理（此处未添加锐化，如有需要可加入）。
+    """
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l)
+    lab_enhanced = cv2.merge([l_enhanced, a, b])
+    enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+    return enhanced
+
 # ----------------------- 交互式对象插入模块 -----------------------
 def nothing(x):
     pass
 
 def insertion_mouse_callback(event, x, y, flags, param):
-    # 用于交互式调整插入位置和大小
     global mouse_coord
     mouse_coord = (x, y)
     (ox, oy, ow, oh) = param['obj_bbox']
@@ -41,7 +57,6 @@ def insertion_mouse_callback(event, x, y, flags, param):
         param['dragging'] = False
 
 def interactive_insertion(video_file, object_file, resize_width, output_dir):
-    # 读取视频第一帧
     cap = cv2.VideoCapture(video_file)
     ret, first_frame = cap.read()
     if not ret:
@@ -49,14 +64,12 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         raise IOError("Cannot read video file: " + video_file)
     cap.release()
 
-    # Resize 第一帧
     h0, w0 = first_frame.shape[:2]
     scale = resize_width / float(w0)
     first_frame = cv2.resize(first_frame, (resize_width, int(h0 * scale)))
     target_frame = first_frame.copy()
     orig_frame = first_frame.copy()
 
-    # 加载对象图像（转换为 BGR 格式）
     object_img = np.array(Image.open(object_file).convert('RGB'))
     object_img = cv2.cvtColor(object_img, cv2.COLOR_RGB2BGR)
 
@@ -93,7 +106,6 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         param['obj_pos'][0] = x
         param['obj_pos'][1] = y
 
-        # 融合对象图像到目标帧（直接覆盖）
         display_img[y:y + new_h, x:x + new_w] = cur_obj_img
         cv2.imshow(window_name, display_img)
         key = cv2.waitKey(20) & 0xFF
@@ -102,12 +114,11 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
     cv2.destroyAllWindows()
 
     fused_img = display_img.copy()
-
-    # source_img
     source_img = np.zeros_like(fused_img)
     source_img[y:y + new_h, x:x + new_w] = cur_obj_img
     roi = source_img[y:y + new_h, x:x + new_w]
-    source_img[y:y + new_h, x:x + new_w] = roi  # 注意这里确保区域尺寸一致
+    roi_smoothed = cv2.bilateralFilter(roi, d=5, sigmaColor=75, sigmaSpace=75)
+    source_img[y:y + new_h, x:x + new_w] = roi_smoothed
     mask_img = source_img.copy()
     mask_img[mask_img > 0] = 255
 
@@ -123,8 +134,7 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
     return fused_img, source_img, mask_img, final_params, orig_frame
 
 # ----------------------- SIFT+边缘校正模块 -----------------------
-manual_points = []  # 用于存放用户点击的四个点
-
+manual_points = []
 def sift_mouse_click(event, x, y, flags, param):
     global manual_points
     if event == cv2.EVENT_LBUTTONDOWN and len(manual_points) < 4:
@@ -166,93 +176,25 @@ def select_and_correct_points(frame):
     return corrected_points
 
 # ----------------------- 光流区域跟踪模块 -----------------------
-
-def sample_flow_local_average(flow, x, y, window_size=5, sigma=1.0):
+def track_region_dense(video_file, region_points, resize_dim, visualize=False):
     """
-    对光流场在 (x,y) 处，以 window_size 为窗口进行加权平均采样，
-    使用高斯权重（sigma为标准差），返回加权平均的光流向量。
-    """
-    half = window_size // 2
-    h, w, _ = flow.shape
-    flows = []
-    weights = []
-    for dy in range(-half, half + 1):
-        for dx in range(-half, half + 1):
-            xi = int(np.clip(x + dx, 0, w - 1))
-            yi = int(np.clip(y + dy, 0, h - 1))
-            flows.append(flow[yi, xi])
-            weight = np.exp(-((dx**2 + dy**2) / (2 * sigma**2)))
-            weights.append(weight)
-    flows = np.array(flows)
-    weights = np.array(weights)
-    return np.sum(flows * weights[:, None], axis=0) / np.sum(weights)
-
-def enhance_texture(frame):
-    """
-    对输入BGR图像进行CLAHE和锐化处理，增强纹理。
-    """
-    # 转换到Lab空间进行CLAHE
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    l_enhanced = clahe.apply(l)
-    lab_enhanced = cv2.merge([l_enhanced, a, b])
-    enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
-    
-    # 可选锐化处理
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]])
-    sharpened = cv2.filter2D(enhanced, -1, kernel)
-    return sharpened
-
-def estimate_global_homography(prev_frame, curr_frame):
-    """
-    利用SIFT特征检测与匹配估计全局Homography，用于全局运动补偿。
-    """
-    gray_prev = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-    gray_curr = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
-    sift = cv2.SIFT_create()
-    kp1, des1 = sift.detectAndCompute(gray_prev, None)
-    kp2, des2 = sift.detectAndCompute(gray_curr, None)
-    
-    # 使用FLANN进行匹配
-    FLANN_INDEX_KDTREE = 1
-    index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
-    search_params = dict(checks=50)
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-    matches = flann.knnMatch(des1, des2, k=2)
-    
-    # Lowe's ratio test
-    good_matches = []
-    for m, n in matches:
-        if m.distance < 0.7 * n.distance:
-            good_matches.append(m)
-    
-    if len(good_matches) > 4:
-        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1,1,2)
-        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1,1,2)
-        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-        return H
-    else:
-        return np.eye(3, dtype=np.float32)
-
-def track_region_with_global_compensation(video_file, region_points, resize_dim, visualize=False):
-    """
-    利用 RAFT 计算密集光流，并结合全局运动补偿：
-      1. 对输入帧进行纹理增强；
-      2. 利用全局特征匹配估计全局Homography，补偿镜头运动；
-      3. 对目标区域内的光流进行采样，并剔除全局运动部分；
-      4. 更新区域角点以保持目标静止。
+    利用 RAFT 模型计算密集光流，对每一帧：
+      1. 对前后帧进行纹理增强（提高局部对比度和纹理）；
+      2. 利用 RAFT 计算光流；
+      3. 计算全局运动：取整个帧的中位数光流；
+      4. 对目标区域（由用户标记的4个点构成）计算中位数位移；
+      5. 用目标区域位移减去全局运动，得到补偿后的运动，使目标区域保持静止；
+      6. 更新区域角点，并保存调试用的光流颜色图。
     """
     motion_threshold = 0.1
+    disp_clip = 5.0
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
     RAFT = RAFT.eval()
     
     cap = cv2.VideoCapture(video_file)
     tracked_regions = []
-    
     ret, frame1 = cap.read()
     if not ret:
         cap.release()
@@ -270,7 +212,7 @@ def track_region_with_global_compensation(video_file, region_points, resize_dim,
     
     frame_idx = 0
     if visualize:
-        window_name = "Global Compensated Tracking"
+        window_name = "Region Tracking"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, resize_dim[0], resize_dim[1])
     
@@ -279,41 +221,55 @@ def track_region_with_global_compensation(video_file, region_points, resize_dim,
         if not ret:
             break
         frame2 = cv2.resize(frame2, resize_dim)
+        # 对当前帧进行纹理增强
         frame2_enhanced = enhance_texture(frame2)
         
-        # 全局运动估计
-        H_global = estimate_global_homography(prev_frame, frame2_enhanced)
-        # 对当前帧进行全局运动补偿
-        frame2_compensated = cv2.warpPerspective(frame2_enhanced, np.linalg.inv(H_global), (resize_dim[0], resize_dim[1]))
-        
-        # 预处理：归一化转换为tensor
-        prev_tensor = torch.tensor(prev_frame, dtype=torch.float32).permute(2,0,1).unsqueeze(0) / 255.0
-        next_tensor = torch.tensor(frame2_compensated, dtype=torch.float32).permute(2,0,1).unsqueeze(0) / 255.0
+        # 全局运动估计：计算整帧的中位数光流（基于增强后的图像）
+        prev_tensor = torch.tensor(prev_frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
+        next_tensor = torch.tensor(frame2_enhanced, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
         prev_tensor = prev_tensor.to(device)
         next_tensor = next_tensor.to(device)
         
         with torch.no_grad():
             flows = RAFT(prev_tensor, next_tensor)
             flow = flows[-1]
-        flow = flow.squeeze(0).detach().cpu().numpy().transpose(1,2,0)
+        flow = flow.squeeze(0).detach().cpu().numpy().transpose(1, 2, 0)
         
-        # 计算全局补偿后的光流：减去全局运动分量（通过H_global转换得到的平移）
-        # 提取H_global平移部分（近似为全局运动）
-        global_disp = H_global[0:2, 2]
-        compensated_flow = flow - global_disp
+        # 保存光流颜色图用于调试
+        flow_color = flow_to_color(flow, multiplier=50)
+        cv2.imwrite(os.path.join(debug_dir, f"flow_frame_{frame_idx:04d}.png"), flow_color)
         
-        # 保存补偿后的光流颜色图
-        flow_color = flow_to_color(compensated_flow, multiplier=100)
-        # cv2.imwrite(os.path.join(debug_dir, f"comp_flow_{frame_idx:04d}.png"), flow_color)
+        # 计算全局运动：整帧中位数光流
+        global_disp = np.median(flow.reshape(-1, 2), axis=0)
         
-        # 对区域内每个点，利用局部加权采样得到细微运动
-        new_pts = []
-        for pt in region_pts:
-            x, y = pt
-            disp = sample_flow_local_average(compensated_flow, x, y, window_size=5, sigma=1.0)
-            new_pt = pt + disp
-            new_pts.append(new_pt)
-        region_pts = np.array(new_pts, dtype=np.float32)
+        # 生成目标区域掩码（由4个角点构成）
+        mask = np.zeros((resize_dim[1], resize_dim[0]), dtype=np.uint8)
+        pts = region_pts.reshape((-1, 1, 2)).astype(np.int32)
+        cv2.fillPoly(mask, [pts], 255)
+        
+        # 计算目标区域内中位数位移
+        region_flow = flow[mask == 255]
+        if region_flow.size == 0:
+            region_disp = np.array([0, 0], dtype=np.float32)
+        else:
+            region_disp = np.median(region_flow, axis=0)
+        
+        # 补偿：目标区域位移减去全局运动
+        compensated_disp = region_disp - global_disp
+        
+        # 对位移进行剪裁
+        norm_disp = np.linalg.norm(compensated_disp)
+        if norm_disp > disp_clip:
+            compensated_disp = compensated_disp / norm_disp * disp_clip
+        
+        if np.linalg.norm(compensated_disp) < motion_threshold:
+            print(f"Frame {frame_idx}: compensated displacement {compensated_disp} below threshold, no update")
+            compensated_disp = np.array([0, 0], dtype=np.float32)
+        else:
+            print(f"Frame {frame_idx}: compensated displacement = {compensated_disp}")
+        
+        # 更新区域角点
+        region_pts = region_pts + compensated_disp
         tracked_regions.append(region_pts.tolist())
         
         prev_frame = frame2_enhanced.copy()
@@ -321,8 +277,8 @@ def track_region_with_global_compensation(video_file, region_points, resize_dim,
         
         if visualize:
             vis_frame = frame2.copy()
-            pts_draw = region_pts.reshape((-1,1,2)).astype(np.int32)
-            cv2.polylines(vis_frame, [pts_draw], isClosed=True, color=(0,255,0), thickness=2)
+            pts_draw = region_pts.reshape((-1, 1, 2)).astype(np.int32)
+            cv2.polylines(vis_frame, [pts_draw], isClosed=True, color=(0, 255, 0), thickness=2)
             cv2.imshow(window_name, vis_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -331,14 +287,30 @@ def track_region_with_global_compensation(video_file, region_points, resize_dim,
         cv2.destroyAllWindows()
     return tracked_regions
 
+def enhance_texture(frame):
+    """
+    对输入BGR图像进行纹理增强：
+      1. 转换到Lab空间；
+      2. 对L通道采用CLAHE增强；
+      3. 合并通道并转换回BGR；
+      可选：可加入锐化处理。
+    """
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l)
+    lab_enhanced = cv2.merge([l_enhanced, a, b])
+    enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+    return enhanced
+
 def flow_to_color(flow, multiplier=50):
     h, w = flow.shape[:2]
-    hsv = np.zeros((h,w,3), dtype=np.uint8)
-    mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+    hsv = np.zeros((h, w, 3), dtype=np.uint8)
+    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
     print("Compensated Flow magnitude: min =", mag.min(), ", max =", mag.max())
-    hsv[...,0] = ang * 180 / np.pi / 2
-    hsv[...,1] = 255
-    hsv[...,2] = np.clip(mag * multiplier, 0, 255)
+    hsv[..., 0] = ang * 180 / np.pi / 2
+    hsv[..., 1] = 255
+    hsv[..., 2] = np.clip(mag * multiplier, 0, 255)
     bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     return bgr
 
@@ -406,7 +378,7 @@ def main():
 
     # 使用用户选取的区域作为初始区域
     resize_dim = (orig_frame.shape[1], orig_frame.shape[0])
-    tracked_regions = track_region_with_global_compensation(args.video_file, corrected_src_points, resize_dim, visualize=True)
+    tracked_regions = track_region_dense(args.video_file, corrected_src_points, resize_dim, visualize=True)
     print(f"Tracked regions obtained on {len(tracked_regions)} frames.")
 
     smoothed_traj = smooth_trajectories(tracked_regions, window_length=15, polyorder=2)
