@@ -10,7 +10,7 @@ from scipy.signal import savgol_filter
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video_002.mp4', help='Path to target video')
+parser.add_argument('--video_file', type=str, default='data/sample_video_006.mp4', help='Path to target video')
 parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
@@ -124,8 +124,8 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         "object_size": {"w": new_w, "h": new_h}
     }
 
-    cv2.imwrite(os.path.join(output_dir, "source_sample_video_02.png"), source_img)
-    cv2.imwrite(os.path.join(output_dir, "mask_sample_video_02.png"), mask_img)
+    cv2.imwrite(os.path.join(output_dir, "source_sample_video_06.png"), source_img)
+    cv2.imwrite(os.path.join(output_dir, "mask_sample_video_06.png"), mask_img)
 
     return fused_img, source_img, mask_img, final_params, orig_frame
 
@@ -392,7 +392,7 @@ def main():
 
     # 第五步：计算每一帧的 Homography，源点为第一帧校正后的点，目标点为平滑后的轨迹点
     homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_02.json")
+    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_06.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
