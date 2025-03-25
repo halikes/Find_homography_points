@@ -20,19 +20,12 @@ os.makedirs(args.output_dir, exist_ok=True)
 
 # ----------------------- 纹理增强模块 -----------------------
 def enhance_texture(frame):
-    """
-    对输入BGR图像进行纹理增强：
-      1. 转换到Lab空间，对L通道采用CLAHE增强；
-      2. 合并通道转换回BGR；
-      3. 简单锐化处理。
-    """
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     l_enhanced = clahe.apply(l)
     lab_enhanced = cv2.merge([l_enhanced, a, b])
     enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
-    # 简单锐化
     kernel = np.array([[0, -1, 0],
                        [-1, 5, -1],
                        [0, -1, 0]])
@@ -41,9 +34,6 @@ def enhance_texture(frame):
 
 # ----------------------- 自动候选点提取 -----------------------
 def extract_candidate_points(frame, max_corners=100):
-    """
-    使用Shi-Tomasi角点检测自动提取候选角点
-    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     corners = cv2.goodFeaturesToTrack(gray, maxCorners=max_corners, qualityLevel=0.01, minDistance=10)
     if corners is not None:
@@ -54,10 +44,6 @@ def extract_candidate_points(frame, max_corners=100):
 
 # ----------------------- 光流估计与候选点跟踪模块 -----------------------
 def sample_flow_local_average(flow, x, y, window_size=5, sigma=1.0):
-    """
-    对光流场在 (x,y) 处，以 window_size 为窗口进行加权平均采样，
-    使用高斯权重返回加权平均的光流向量。
-    """
     half = window_size // 2
     h, w, _ = flow.shape
     flows = []
@@ -75,12 +61,11 @@ def sample_flow_local_average(flow, x, y, window_size=5, sigma=1.0):
 
 def track_candidates_with_raft(video_file, resize_dim, max_corners=100, visualize=False, beta=0.8):
     """
-    自动提取候选角点，然后利用 RAFT 计算密集光流，
-    对候选点逐帧跟踪（采用局部加权采样+指数平滑），
-    并在每一帧计算初始候选点与当前候选点的全局Homography矩阵，
-    返回候选点轨迹和每帧的Homography结果。
+    自动提取候选角点，然后利用 RAFT 计算密集光流，对候选点逐帧跟踪，
+    并在每一帧计算初始候选点与当前候选点之间的全局Homography矩阵，
+    返回候选点轨迹和每帧Homography结果（包含第一帧）。
     """
-    max_disp = 10.0  # 位移剪裁
+    max_disp = 10.0  
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
@@ -99,7 +84,7 @@ def track_candidates_with_raft(video_file, resize_dim, max_corners=100, visualiz
     prev_frame = frame1_enhanced.copy()
     
     # 自动提取候选角点
-    init_points = extract_candidate_points(frame1, max_corners)
+    init_points = extract_candidate_points(frame1, max_corners=max_corners)
     if init_points.shape[0] < 4:
         print("Not enough candidate points detected.")
         cap.release()
@@ -107,13 +92,16 @@ def track_candidates_with_raft(video_file, resize_dim, max_corners=100, visualiz
     points = init_points.copy()  # (N,2)
     tracked_points.append(points.tolist())
     
-    # 保存初始候选点，用于计算全局Homography
+    # 保存初始候选点
     initial_points = points.copy()
     
-    # 初始化累积位移为零
+    # 初始化累积位移
     accumulated_disp = np.zeros_like(points)
     
-    frame_idx = 0
+    # 对第一帧，Homography 为单位矩阵
+    homography_results.append({"frame_idx": 0, "homography_matrix": np.eye(3, dtype=np.float32).tolist()})
+    
+    frame_idx = 1
     if visualize:
         window_name = "Candidate Tracking"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -134,9 +122,9 @@ def track_candidates_with_raft(video_file, resize_dim, max_corners=100, visualiz
         with torch.no_grad():
             flows = RAFT(prev_tensor, next_tensor)
             flow = flows[-1]
-        flow = flow.squeeze(0).detach().cpu().numpy().transpose(1,2,0)  # (H,W,2)
+        flow = flow.squeeze(0).detach().cpu().numpy().transpose(1,2,0)
         
-        # 对每个候选点采样光流，得到位移
+        # 对所有候选点进行局部加权采样，获得位移
         raft_disp = []
         for pt in points:
             x, y = pt
@@ -151,13 +139,13 @@ def track_candidates_with_raft(video_file, resize_dim, max_corners=100, visualiz
         accumulated_disp = beta * accumulated_disp + (1 - beta) * raft_disp
         new_points = points + accumulated_disp
         
-        # 计算当前候选点与初始候选点之间的全局Homography
+        # 计算当前初始候选点与新候选点之间的Homography
         H, status = cv2.findHomography(initial_points, new_points, cv2.RANSAC, 5.0)
         if H is None:
             H = np.eye(3, dtype=np.float32)
         homography_results.append({"frame_idx": frame_idx, "homography_matrix": H.tolist()})
         
-        # 更新候选点
+        # 更新候选点和记录
         points = new_points.copy()
         tracked_points.append(points.tolist())
         
@@ -171,12 +159,13 @@ def track_candidates_with_raft(video_file, resize_dim, max_corners=100, visualiz
             cv2.imshow(window_name, vis_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+                
     cap.release()
     if visualize:
         cv2.destroyAllWindows()
     
     # 保存Homography结果到JSON
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_05_raft.json")
+    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_05_raft_self.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
