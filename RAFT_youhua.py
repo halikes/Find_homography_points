@@ -12,12 +12,10 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video_005.mp4', help='Path to target video')
-parser.add_argument('--object_file', type=str, default='data/source_flower.png', help='Path to object image')
+parser.add_argument('--video_file', type=str, default='data/sample_video_006.mp4', help='Path to target video')
+parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
-parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the frame')
-parser.add_argument('--max_corners', type=int, default=100, help='Max number of candidate points')
-parser.add_argument('--min_inliers', type=int, default=4, help='Minimum number of inliers to continue tracking')
+parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
 args = parser.parse_args()
 os.makedirs(args.output_dir, exist_ok=True)
 
@@ -26,6 +24,7 @@ def nothing(x):
     pass
 
 def insertion_mouse_callback(event, x, y, flags, param):
+    # 用于交互式调整插入位置和大小
     global mouse_coord
     mouse_coord = (x, y)
     (ox, oy, ow, oh) = param['obj_bbox']
@@ -42,6 +41,7 @@ def insertion_mouse_callback(event, x, y, flags, param):
         param['dragging'] = False
 
 def interactive_insertion(video_file, object_file, resize_width, output_dir):
+    # 读取视频第一帧
     cap = cv2.VideoCapture(video_file)
     ret, first_frame = cap.read()
     if not ret:
@@ -49,12 +49,14 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         raise IOError("Cannot read video file: " + video_file)
     cap.release()
 
+    # Resize 第一帧
     h0, w0 = first_frame.shape[:2]
     scale = resize_width / float(w0)
     first_frame = cv2.resize(first_frame, (resize_width, int(h0 * scale)))
     target_frame = first_frame.copy()
     orig_frame = first_frame.copy()
 
+    # 加载对象图像（转换为 BGR 格式）
     object_img = np.array(Image.open(object_file).convert('RGB'))
     object_img = cv2.cvtColor(object_img, cv2.COLOR_RGB2BGR)
 
@@ -91,6 +93,7 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         param['obj_pos'][0] = x
         param['obj_pos'][1] = y
 
+        # 融合对象图像到目标帧（直接覆盖）
         display_img[y:y + new_h, x:x + new_w] = cur_obj_img
         cv2.imshow(window_name, display_img)
         key = cv2.waitKey(20) & 0xFF
@@ -99,10 +102,13 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
     cv2.destroyAllWindows()
 
     fused_img = display_img.copy()
+
+    # source_img
     source_img = np.zeros_like(fused_img)
     source_img[y:y + new_h, x:x + new_w] = cur_obj_img
     roi = source_img[y:y + new_h, x:x + new_w]
-    source_img[y:y + new_h, x:x + new_w] = roi  # 确保区域尺寸一致
+    roi_smoothed = cv2.bilateralFilter(roi, d=5, sigmaColor=75, sigmaSpace=75)
+    source_img[y:y + new_h, x:x + new_w] = roi_smoothed  # 注意这里确保区域尺寸一致
     mask_img = source_img.copy()
     mask_img[mask_img > 0] = 255
 
@@ -112,8 +118,8 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         "object_size": {"w": new_w, "h": new_h}
     }
 
-    cv2.imwrite(os.path.join(output_dir, "source_img_sample_video_05.png"), source_img)
-    cv2.imwrite(os.path.join(output_dir, "mask_img_sample_video_05.png"), mask_img)
+    cv2.imwrite(os.path.join(output_dir, "source_img_sample_video_06.png"), source_img)
+    cv2.imwrite(os.path.join(output_dir, "mask_img_sample_video_06.png"), mask_img)
 
     return fused_img, source_img, mask_img, final_params, orig_frame
 
@@ -160,181 +166,103 @@ def select_and_correct_points(frame):
         print(f"Original: {pt}, Corrected: {cp}")
     return corrected_points
 
-
-# ----------------------- 纹理增强模块 -----------------------
-def enhance_texture(frame):
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    l_enhanced = clahe.apply(l)
-    lab_enhanced = cv2.merge([l_enhanced, a, b])
-    enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]])
-    sharpened = cv2.filter2D(enhanced, -1, kernel)
-    return sharpened
-
-# ----------------------- 自动候选点提取 -----------------------
-def extract_candidate_points(frame, max_corners=100):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corners = cv2.goodFeaturesToTrack(gray, maxCorners=max_corners, qualityLevel=0.01, minDistance=10)
-    if corners is not None:
-        corners = np.squeeze(corners)
-    else:
-        corners = np.empty((0,2), dtype=np.float32)
-    return corners.astype(np.float32)
-
 # ----------------------- 光流区域跟踪模块 -----------------------
-def sample_flow_local_average(flow, x, y, window_size=5, sigma=1.0):
-    half = window_size // 2
-    h, w, _ = flow.shape
-    flows = []
-    weights = []
-    for dy in range(-half, half + 1):
-        for dx in range(-half, half + 1):
-            xi = int(np.clip(x + dx, 0, w - 1))
-            yi = int(np.clip(y + dy, 0, h - 1))
-            flows.append(flow[yi, xi])
-            weight = np.exp(-((dx**2 + dy**2) / (2 * sigma**2)))
-            weights.append(weight)
-    flows = np.array(flows)
-    weights = np.array(weights)
-    return np.sum(flows * weights[:, None], axis=0) / np.sum(weights)
-
-def track_candidates_with_raft(video_file, resize_dim, max_corners=100, visualize=False, beta=0.8):
+def track_region_dense(video_file, region_points, resize_dim, visualize=False):
     """
-    自动提取候选角点，然后利用 RAFT 计算密集光流，对候选点逐帧跟踪，
-    并利用RANSAC剔除跟踪失败的点，计算初始候选点与当前候选点之间的全局Homography。
-    对每一帧的Homography矩阵都保存到列表中。
+    改进功能：
+    1. 跟踪区域内的所有特征点
+    2. 使用双向光流验证筛选稳定点
+    3. 根据稳定点计算全局单应性
     """
-    max_disp = 10.0  
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
-    RAFT = RAFT.eval()
+    raft = raft_large(weights=Raft_Large_Weights.DEFAULT).to(device).eval()
     
     cap = cv2.VideoCapture(video_file)
-    tracked_points = []
-    homography_results = []
+    w, h = resize_dim
+    all_homographies = []
     
-    ret, frame1 = cap.read()
-    if not ret:
-        cap.release()
-        return None, None
-    frame1 = cv2.resize(frame1, resize_dim)
-    frame1_enhanced = enhance_texture(frame1)
-    prev_frame = frame1_enhanced.copy()
+    # 初始化区域
+    region_mask = np.zeros((h, w), dtype=np.uint8)
+    region_pts = np.array(region_points, dtype=np.int32)
+    cv2.fillPoly(region_mask, [region_pts], 255)
     
-    # 自动候选点提取
-    init_points = extract_candidate_points(frame1_enhanced, max_corners=max_corners)
-    if init_points.shape[0] < 4:
-        print("Not enough candidate points detected.")
-        cap.release()
-        return None, None
-    points = init_points.copy()  # (N,2)
-    tracked_points.append(points.tolist())
+    # 提取初始特征点
+    prev_frame = cv2.resize(cap.read()[1], (w, h))
+    prev_points = cv2.goodFeaturesToTrack(
+        cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY), 
+        maxCorners=500,
+        qualityLevel=0.01,
+        minDistance=5,
+        mask=region_mask
+    ).reshape(-1, 2)
+
+    with torch.no_grad():
+        pbar = tqdm(total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))-1)
+        while True:
+            ret, curr_frame = cap.read()
+            if not ret: break
+            curr_frame = cv2.resize(curr_frame, (w, h))
+            
+            # 前向光流计算
+            prev_tensor = torch.from_numpy(prev_frame).permute(2,0,1).unsqueeze(0).to(device)/255.0
+            curr_tensor = torch.from_numpy(curr_frame).permute(2,0,1).unsqueeze(0).to(device)/255.0
+            flow = raft(prev_tensor, curr_tensor)[-1][0].cpu().numpy().transpose(1,2,0)
+            
+            # 跟踪点传播
+            new_points = prev_points + flow[prev_points[:,1].astype(int), prev_points[:,0].astype(int)]
+            
+            # 反向验证
+            back_flow = raft(curr_tensor, prev_tensor)[-1][0].cpu().numpy().transpose(1,2,0)
+            back_points = new_points + back_flow[new_points[:,1].astype(int), new_points[:,0].astype(int)]
+            
+            # 计算双向误差
+            error = np.linalg.norm(prev_points - back_points, axis=1)
+            valid_mask = error < 2.0  # 可调参数
+            
+            # 筛选稳定点
+            stable_points = new_points[valid_mask]
+            
+            # 计算全局单应性
+            if len(stable_points) >= 4:
+                H, _ = cv2.findHomography(prev_points[valid_mask], stable_points, cv2.RANSAC, 5.0)
+            else:
+                H = np.eye(3)
+            
+            all_homographies.append(H.tolist())
+            
+            # 更新跟踪点
+            prev_points = stable_points
+            prev_frame = curr_frame.copy()
+            
+            # 补充新特征点
+            if len(prev_points) < 100:
+                new_points = cv2.goodFeaturesToTrack(
+                    cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY),
+                    maxCorners=500,
+                    qualityLevel=0.01,
+                    minDistance=5,
+                    mask=region_mask
+                ).reshape(-1, 2)
+                prev_points = np.concatenate([prev_points, new_points])
+            
+            # 边界约束
+            prev_points[:,0] = np.clip(prev_points[:,0], 0, w-1)
+            prev_points[:,1] = np.clip(prev_points[:,1], 0, h-1)
+            
+            pbar.update(1)
     
-    # 保存初始候选点，用于Homography计算
-    initial_points = points.copy()
-    
-    # 初始化累积位移
-    accumulated_disp = np.zeros_like(points)
-    
-    # 帧0的Homography设为单位矩阵
-    homography_results.append({"frame_idx": 0, "homography_matrix": np.eye(3, dtype=np.float32).tolist()})
-    
-    frame_idx = 1
-    if visualize:
-        window_name = "Candidate Tracking"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, resize_dim[0], resize_dim[1])
-    
-    while True:
-        ret, frame2 = cap.read()
-        if not ret:
-            break
-        frame2 = cv2.resize(frame2, resize_dim)
-        frame2_enhanced = enhance_texture(frame2)
-        
-        prev_tensor = torch.tensor(prev_frame, dtype=torch.float32).permute(2,0,1).unsqueeze(0) / 255.0
-        next_tensor = torch.tensor(frame2_enhanced, dtype=torch.float32).permute(2,0,1).unsqueeze(0) / 255.0
-        prev_tensor = prev_tensor.to(device)
-        next_tensor = next_tensor.to(device)
-        
-        with torch.no_grad():
-            flows = RAFT(prev_tensor, next_tensor)
-            flow = flows[-1]
-        flow = flow.squeeze(0).detach().cpu().numpy().transpose(1,2,0)  # (H,W,2)
-        
-        # 对每个候选点进行局部加权采样获得位移
-        raft_disp = []
-        for pt in points:
-            x, y = pt
-            disp = sample_flow_local_average(flow, x, y, window_size=5, sigma=1.0)
-            norm_disp = np.linalg.norm(disp)
-            if norm_disp > max_disp:
-                disp = disp / norm_disp * max_disp
-            raft_disp.append(disp)
-        raft_disp = np.array(raft_disp)
-        
-        # 多帧累积：指数平滑更新
-        accumulated_disp = beta * accumulated_disp + (1 - beta) * raft_disp
-        new_points = points + accumulated_disp
-        
-        # 计算初始候选点与当前候选点之间的Homography
-        H, mask = cv2.findHomography(initial_points, new_points, cv2.RANSAC, 5.0)
-        if H is None:
-            H = np.eye(3, dtype=np.float32)
-            mask = np.ones((new_points.shape[0], 1), dtype=np.uint8)
-        homography_results.append({"frame_idx": frame_idx, "homography_matrix": H.tolist()})
-        
-        # 剔除跟踪失败的点：仅保留RANSAC内点
-        mask = mask.ravel().astype(bool)
-        inlier_count = np.sum(mask)
-        if inlier_count < args.min_inliers:
-            print(f"Frame {frame_idx}: Not enough inliers ({inlier_count}), stopping tracking.")
-            break
-        new_points = new_points[mask]
-        initial_points = initial_points[mask]
-        accumulated_disp = accumulated_disp[mask]
-        
-        points = new_points.copy()
-        tracked_points.append(points.tolist())
-        
-        prev_frame = frame2_enhanced.copy()
-        frame_idx += 1
-        
-        if visualize:
-            vis_frame = frame2.copy()
-            for pt in points:
-                cv2.circle(vis_frame, (int(pt[0]), int(pt[1])), 3, (0,255,0), -1)
-            cv2.imshow(window_name, vis_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
     cap.release()
-    if visualize:
-        cv2.destroyAllWindows()
-    
-    # 保存Homography结果到JSON
-    homography_json = os.path.join(args.output_dir, "global_homography_results.json")
-    with open(homography_json, "w") as f:
-        json.dump(homography_results, f, indent=4)
-    print("Homography results saved to", homography_json)
-    
-    return tracked_points, homography_results
+    return all_homographies
 
-def flow_to_color(flow, multiplier=50):
-    h, w = flow.shape[:2]
-    hsv = np.zeros((h, w, 3), dtype=np.uint8)
-    mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
-    print("Compensated Flow magnitude: min =", mag.min(), ", max =", mag.max())
-    hsv[...,0] = ang * 180 / np.pi / 2
-    hsv[...,1] = 255
-    hsv[...,2] = np.clip(mag * multiplier, 0, 255)
-    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    return bgr
+# ----------------------- 改进的单应性计算模块 -----------------------
+def compute_homography_for_frames(src_points, homographies):
+    """使用改进后的单应性序列直接生成结果"""
+    return [{
+        "frame_idx": idx,
+        "homography_matrix": H
+    } for idx, H in enumerate(homographies)]
 
+# ----------------------- 轨迹平滑与可视化 -----------------------
 def smooth_trajectories(tracked_points, window_length=15, polyorder=2):
     num_frames = len(tracked_points)
     num_points = len(tracked_points[0])
@@ -353,19 +281,19 @@ def smooth_trajectories(tracked_points, window_length=15, polyorder=2):
 def plot_trajectories(original_traj, smoothed_traj):
     num_frames = len(original_traj)
     num_points = len(original_traj[0])
-    orig_array = np.array(original_traj, dtype=object)
+    orig_array = np.array(original_traj)
     plt.figure(figsize=(15, 15))
     colors = ['r', 'g', 'b', 'c']
     for i in range(num_points):
-        pts = []
-        for frame in original_traj:
-            if i < len(frame):
-                pts.append(frame[i])
-        pts = np.array(pts)
-        plt.plot(pts[:,0], pts[:,1], 'o-', color=colors[i], label=f"Point {i+1}")
+        orig_points = orig_array[:, i, :]
+        smooth_points = smoothed_traj[:, i, :]
+        plt.plot(smooth_points[:, 0], smooth_points[:, 1], 's--', color=colors[i], alpha=0.5,
+                 label=f"Smoothed Point {i + 1}")
+        plt.plot(orig_points[:, 0], orig_points[:, 1], 'o-', color='gray',
+                 label=f"Original Point {i + 1}")
     plt.xlabel("X coordinate")
     plt.ylabel("Y coordinate")
-    plt.title("Tracked Candidate Trajectories")
+    plt.title("Original and Smoothed Trajectories")
     plt.legend()
     plt.grid(True)
     plt.show()
@@ -382,6 +310,19 @@ def compute_homography_for_frames(src_points, smoothed_traj):
         homography_results.append({"frame_idx": idx, "homography_matrix": H.tolist()})
     return homography_results
 
+# ----------------------- 辅助函数 -----------------------
+def convert_ndarray_to_list(data):
+    """Recursively convert NumPy arrays to lists in a dictionary or list."""
+    if isinstance(data, np.ndarray):
+        return data.tolist()
+    elif isinstance(data, dict):
+        return {key: convert_ndarray_to_list(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [convert_ndarray_to_list(item) for item in data]
+    else:
+        return data
+    
+# ----------------------- 主程序 -----------------------
 def main():
     print("Starting interactive insertion...")
     fused_img, source_img, mask_img, ins_params, orig_frame = interactive_insertion(
@@ -393,20 +334,18 @@ def main():
     print("Now select 4 points for global Homography computation on the original frame...")
     corrected_src_points = select_and_correct_points(orig_frame)
     print("Corrected source points:", corrected_src_points)
-
-    # 使用用户选取的区域作为初始区域，进行全局运动补偿跟踪
+    
+    print("Processing feature tracking...")
     resize_dim = (orig_frame.shape[1], orig_frame.shape[0])
-    tracked_regions, homography_results = track_candidates_with_raft(args.video_file, resize_dim, max_corners=args.max_corners, visualize=True)
-    print(f"Tracked regions obtained on {len(tracked_regions)} frames.")
-
-    smoothed_traj = smooth_trajectories(tracked_regions, window_length=15, polyorder=2)
-    plot_trajectories(tracked_regions, smoothed_traj)
-
-    homography_final = compute_homography_for_frames(corrected_src_points, smoothed_traj)
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_05_raft-homo.json")
+    homographies = track_region_dense(args.video_file, corrected_src_points, resize_dim, visualize=True)
+    
+    # 保存结果
+    homography_results = compute_homography_for_frames(corrected_src_points, homographies)
+    homography_json = os.path.join(args.output_dir, "global_homography_results.json")
     with open(homography_json, "w") as f:
-        json.dump(homography_final, f, indent=4)
-    print("Homography results saved to", homography_json)
+        json.dump(homography_results, f, indent=4)
+    
+    print(f"Homography results saved to {homography_json}")
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,4 @@
 import cv2
-import torch
 import numpy as np
 import argparse
 import os
@@ -8,13 +7,10 @@ from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
-from model.PWC_src.pwc import PWC_Net
-# remmenber to install the pwcnet package
-# pip install pwcnet
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/Zoom_IN_OUT.mp4', help='Path to target video')
+parser.add_argument('--video_file', type=str, default='data/sample_video_002.mp4', help='Path to target video')
 parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
@@ -117,13 +113,9 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
     source_img = np.zeros_like(fused_img)
     source_img[y:y + new_h, x:x + new_w] = cur_obj_img
 
-    roi = source_img[y:y + new_h, x:x + new_w]
-    roi_smoothed = cv2.bilateralFilter(roi, d=5, sigmaColor=75, sigmaSpace=75)
-    source_img[y:y + new_h, x:x + new_w] = roi_smoothed
-
     # mask_img
-    mask_img = source_img.copy()
-    mask_img[mask_img > 0] = 255
+    gray = cv2.cvtColor(source_img, cv2.COLOR_BGR2GRAY)
+    _, mask_img = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
 
 
     final_params = {
@@ -132,8 +124,8 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         "object_size": {"w": new_w, "h": new_h}
     }
 
-    cv2.imwrite(os.path.join(output_dir, "source_img_sample_video_01.png"), source_img)
-    cv2.imwrite(os.path.join(output_dir, "mask_img_sample_video_01.png"), mask_img)
+    cv2.imwrite(os.path.join(output_dir, "source_sample_video_02.png"), source_img)
+    cv2.imwrite(os.path.join(output_dir, "mask_sample_video_02.png"), mask_img)
 
     return fused_img, source_img, mask_img, final_params, orig_frame
 
@@ -180,7 +172,7 @@ def select_and_correct_points(frame):
     while len(manual_points) < 4:
         disp = frame.copy()
         for pt in manual_points:
-            cv2.circle(disp, pt, 5, (0, 0, 255), -1)
+            cv2.circle(disp, pt, 3, (0, 0, 255), -1)
         cv2.imshow(window_name, disp)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -197,86 +189,59 @@ def select_and_correct_points(frame):
     return corrected_points
 
 
-def track_points_pwcnet(video_file, initial_points, resize_dim, visualize=False):
+def track_points(video_file, initial_points, resize_dim, visualize=False):
     """
-    使用 PWCNet 计算光流，跟踪初始点在整个视频中的运动轨迹（使用彩色图像）。
+    利用光流跟踪，将初始的4个校正点在整个视频中跟踪，
+    返回一个列表，每个元素为当前帧跟踪到的4个点（格式：[(x,y), ...]）。
+    如果 visualize=True，则实时显示窗口“Optical Flow Tracking”。
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # `pwc_net` 先被初始化
-    pwc_net = PWC_Net()  # 这里需要你的 PWCNet 初始化代码
-    # pwc_net.load_state_dict(torch.load("model/pwc_net_chairs.pth"))  # 确保模型权重加载
-
-    #让 PWCNet 运行在 GPU/CPU
-    pwc_net = pwc_net.to(device)
-    pwc_net.eval()
-
-    #确保输入张量也在 GPU/CPU 上
-    prev_tensor = prev_tensor.to(device)
-    next_tensor = next_tensor.to(device)
-    
     cap = cv2.VideoCapture(video_file)
     tracked_points = []
-
-    ret, frame1 = cap.read()
+    prev_points = np.array(initial_points, dtype=np.float32).reshape(-1, 1, 2)
+    ret, frame = cap.read()
     if not ret:
         cap.release()
         return tracked_points
-
-    frame1 = cv2.resize(frame1, resize_dim)
-    prev_frame = frame1  # **保持彩色图像**
-    
-    prev_points = np.array(initial_points, dtype=np.float32).reshape(-1, 1, 2)
+    frame = cv2.resize(frame, resize_dim)
+    prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     tracked_points.append([tuple(pt[0]) for pt in prev_points])
 
     if visualize:
-        window_name = "PWCNet Optical Flow Tracking"
+        window_name = "Optical Flow Tracking"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, resize_dim[0], resize_dim[1])
 
     while True:
-        ret, frame2 = cap.read()
+        ret, frame = cap.read()
         if not ret:
             break
-
-        frame2 = cv2.resize(frame2, resize_dim)
-        
-        # **彩色图像转换为 PyTorch Tensor**
-        prev_tensor = torch.tensor(prev_frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
-        next_tensor = torch.tensor(frame2, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
-
-        # **计算彩色光流**
-        flow = pwc_net(prev_tensor, next_tensor)
-        flow = flow.squeeze(0).detach().numpy().transpose(1, 2, 0)
-
-        # **更新点位置**
-        new_points = []
-        for pt in prev_points:
-            x, y = int(pt[0][0]), int(pt[0][1])
-            dx, dy = flow[y, x]
-            new_x, new_y = x + dx, y + dy
-            new_points.append([[new_x, new_y]])
-
-        prev_points = np.array(new_points, dtype=np.float32)
+        frame = cv2.resize(frame, resize_dim)
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        next_points, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray_frame, prev_points, None)
+        good_points = []
+        for i, st in enumerate(status):
+            if st[0] == 1:
+                good_points.append(next_points[i])
+            else:
+                good_points.append(prev_points[i])
+        prev_points = np.array(good_points, dtype=np.float32)
         tracked_points.append([tuple(pt[0]) for pt in prev_points])
-        prev_frame = frame2.copy()  # **更新前一帧**
+        prev_gray = gray_frame.copy()
 
         if visualize:
-            vis_frame = frame2.copy()
+            vis_frame = frame.copy()
             for pt in prev_points:
-                cv2.circle(vis_frame, (int(pt[0][0]), int(pt[0][1])), 3, (0, 255, 0), -1)
+                cv2.circle(vis_frame, (int(pt[0][0]), int(pt[0][1])), 1, (0, 255, 0), -1)
             cv2.imshow(window_name, vis_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
     if visualize:
         cv2.destroyWindow(window_name)
-
     cap.release()
     return tracked_points
 
 
-def smooth_trajectories(tracked_points, window_length=15, polyorder=2):
+def smooth_trajectories(tracked_points, window_length=21, polyorder=2):
     """
     对每个选点的轨迹进行 Savitzky-Golay 平滑，返回平滑后的轨迹列表。
     tracked_points：list，每个元素为一帧跟踪到的4个点（格式：[(x,y), ...]）
@@ -371,17 +336,17 @@ def main():
 
     # 第三步：利用光流跟踪，将校正后的4个点在整个视频中跟踪
     resize_dim = (orig_frame.shape[1], orig_frame.shape[0])
-    tracked_points = track_points_pwcnet(args.video_file, corrected_src_points, resize_dim, visualize=True)
+    tracked_points = track_points(args.video_file, corrected_src_points, resize_dim, visualize=True)
     print(f"Tracked points obtained on {len(tracked_points)} frames.")
 
     # 第四步：对跟踪轨迹进行平滑处理
-    smoothed_traj = smooth_trajectories(tracked_points, window_length=15, polyorder=2)
+    smoothed_traj = smooth_trajectories(tracked_points, window_length=21, polyorder=2)
     # 可视化平滑后的轨迹
     plot_trajectories(tracked_points, smoothed_traj)
 
     # 第五步：计算每一帧的 Homography，源点为第一帧校正后的点，目标点为平滑后的轨迹点
     homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_01_pwc.json")
+    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_02.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)

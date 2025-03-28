@@ -10,7 +10,7 @@ from scipy.signal import savgol_filter
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video_006.mp4', help='Path to target video')
+parser.add_argument('--video_file', type=str, default='data/sample_video_005.mp4', help='Path to target video')
 parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
@@ -124,8 +124,8 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         "object_size": {"w": new_w, "h": new_h}
     }
 
-    cv2.imwrite(os.path.join(output_dir, "source_sample_video_06.png"), source_img)
-    cv2.imwrite(os.path.join(output_dir, "mask_sample_video_06.png"), mask_img)
+    cv2.imwrite(os.path.join(output_dir, "source_sample_video_05.png"), source_img)
+    cv2.imwrite(os.path.join(output_dir, "mask_sample_video_05.png"), mask_img)
 
     return fused_img, source_img, mask_img, final_params, orig_frame
 
