@@ -95,7 +95,6 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         param['obj_pos'][0] = x
         param['obj_pos'][1] = y
 
-        # 融合对象图像到目标帧（直接覆盖）
         display_img[y:y + new_h, x:x + new_w] = cur_obj_img
         cv2.imshow(window_name, display_img)
         key = cv2.waitKey(20) & 0xFF
