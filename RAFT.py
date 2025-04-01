@@ -280,7 +280,34 @@ def track_region_dense(video_file, region_points, resize_dim, visualize=False):
         cv2.destroyAllWindows()
     return tracked_regions
 
+def estimate_camera_pose(flow, K):
+    """
+    通过光流计算相机的相对位姿（R, t）
+    flow: (H, W, 2) 光流场
+    K: 相机内参矩阵 (3x3)
 
+    返回:
+    R: 旋转矩阵
+    t: 平移向量
+    """
+    h, w = flow.shape[:2]
+    
+    # 生成像素坐标网格
+    y, x = np.mgrid[0:h, 0:w]
+    points1 = np.stack([x.ravel(), y.ravel()], axis=-1).astype(np.float32)
+    points2 = points1 + flow.reshape(-1, 2)  # 加上光流位移，得到对应点
+
+    # 计算本质矩阵
+    E, mask = cv2.findEssentialMat(points1, points2, K, method=cv2.RANSAC, threshold=1.0)
+
+    if E is None:
+        print("Essential matrix estimation failed.")
+        return np.eye(3), np.zeros((3, 1))
+
+    # 从本质矩阵恢复 R 和 t
+    _, R, t, mask = cv2.recoverPose(E, points1, points2, K)
+
+    return R, t
 
 # ----------------------- 轨迹平滑与可视化 -----------------------
 def smooth_trajectories(tracked_points, window_length=15, polyorder=2):

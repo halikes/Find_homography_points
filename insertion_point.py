@@ -8,10 +8,11 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
 from scipy.ndimage import gaussian_filter1d
+from scipy.spatial import procrustes
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video_002.mp4', help='Path to target video')
+parser.add_argument('--video_file', type=str, default='data/sample_video_002_7s.mp4', help='Path to target video')
 parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
@@ -201,125 +202,7 @@ def select_and_correct_points(frame):
     return corrected_points
 
 
-def refine_point_by_feature_matching(prev_gray, curr_gray, predicted_point, window_size=30, distance_threshold=50):
-    """
-    在当前帧中以predicted_point为中心的局部区域内，通过ORB匹配辅助校正点位。
-    prev_gray: 上一帧灰度图（作为参考）
-    curr_gray: 当前帧灰度图
-    predicted_point: 光流预测的点 (x, y)
-    window_size: 搜索区域大小
-    distance_threshold: 如果匹配距离大于该值，则认为匹配不可靠
-    返回：校正后的点 (x, y)
-    """
-    x, y = int(predicted_point[0]), int(predicted_point[1])
-    half_win = window_size // 2
 
-    # 定义当前帧局部区域（注意边界处理）
-    h, w = curr_gray.shape[:2]
-    x1 = max(0, x - half_win)
-    y1 = max(0, y - half_win)
-    x2 = min(w, x + half_win)
-    y2 = min(h, y + half_win)
-    curr_patch = curr_gray[y1:y2, x1:x2]
-    if curr_patch.size == 0:
-        return predicted_point
-
-    # 用上一帧中相同区域作为参考patch（更新参考，不使用固定模板）
-    ref_patch = prev_gray[y1:y2, x1:x2]
-    if ref_patch.size == 0:
-        return predicted_point
-
-    # 初始化ORB检测器
-    orb = cv2.ORB_create(200)
-    kp_ref, des_ref = orb.detectAndCompute(ref_patch, None)
-    kp_curr, des_curr = orb.detectAndCompute(curr_patch, None)
-    if des_ref is None or des_curr is None or len(kp_ref)==0 or len(kp_curr)==0:
-        return predicted_point
-
-    # 使用暴力匹配器进行匹配
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(des_ref, des_curr)
-    if not matches:
-        return predicted_point
-
-    # 选择最佳匹配
-    best_match = min(matches, key=lambda m: m.distance)
-    if best_match.distance > distance_threshold:
-        return predicted_point
-
-    # 得到匹配点在当前patch中的坐标，并换算回全图坐标
-    kp = kp_curr[best_match.trainIdx].pt
-    refined_x = x1 + kp[0]
-    refined_y = y1 + kp[1]
-    return (refined_x, refined_y)
-
-
-def track_points(video_file, initial_points, resize_dim, visualize=False):
-    """
-    利用光流跟踪初始的4个校正点，同时在每一帧中采用基于ORB的特征匹配辅助校正，
-    返回每一帧跟踪到的4个点。
-    这里使用上一帧作为参考，保证匹配区域能够反映当前运动信息，
-    同时用加权融合的方式更新点位置。
-    """
-    cap = cv2.VideoCapture(video_file)
-    tracked_points = []
-    prev_points = np.array(initial_points, dtype=np.float32).reshape(-1, 1, 2)
-    
-    ret, frame = cap.read()
-    if not ret:
-        cap.release()
-        return tracked_points
-    frame = cv2.resize(frame, resize_dim)
-    prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    tracked_points.append([tuple(pt[0]) for pt in prev_points])
-    
-    if visualize:
-        window_name = "Optical Flow Tracking with Feature Correction"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, resize_dim[0], resize_dim[1])
-    
-    alpha = 0.3  # 权重因子，表示校正结果的采纳比例（可调）
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.resize(frame, resize_dim)
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # 计算光流，获得预测点
-        next_points, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_points, None)
-        corrected_points = []
-        for i, st in enumerate(status):
-            if st[0] == 1:
-                flow_pt = next_points[i][0]
-                # 用当前上一帧（prev_gray）作为参考进行特征匹配辅助校正
-                refined_pt = refine_point_by_feature_matching(prev_gray, curr_gray, flow_pt,
-                                                                window_size=30, distance_threshold=50)
-                # 根据匹配可靠性加权融合：如果匹配结果与光流结果有差异，则部分采纳校正结果
-                new_x = (1 - alpha) * flow_pt[0] + alpha * refined_pt[0]
-                new_y = (1 - alpha) * flow_pt[1] + alpha * refined_pt[1]
-                corrected_points.append((new_x, new_y))
-            else:
-                corrected_points.append(tuple(prev_points[i][0]))
-        prev_points = np.array(corrected_points, dtype=np.float32).reshape(-1, 1, 2)
-        tracked_points.append(corrected_points)
-        
-        # 更新上一帧为当前帧
-        prev_gray = curr_gray.copy()
-        
-        if visualize:
-            vis_frame = frame.copy()
-            for pt in prev_points:
-                cv2.circle(vis_frame, (int(pt[0][0]), int(pt[0][1])), 3, (0, 255, 0), -1)
-            cv2.imshow(window_name, vis_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-    if visualize:
-        cv2.destroyWindow(window_name)
-    cap.release()
-    return tracked_points
-
-"""
 def track_points(video_file, initial_points, resize_dim, visualize=False):
     
     cap = cv2.VideoCapture(video_file)
@@ -366,49 +249,66 @@ def track_points(video_file, initial_points, resize_dim, visualize=False):
         cv2.destroyWindow(window_name)
     cap.release()
     return tracked_points
-"""
 
-def smooth_trajectories(tracked_points, window_length=21, polyorder=2, sigma=1.5):
+def smooth_trajectories_with_consistent_motion(tracked_points, window_length=21, polyorder=2, sigma=1.5):
     """
-    对每个选点的轨迹进行 Savitzky-Golay 平滑，并用高斯滤波进一步优化。
-    
+    对跟踪的点进行平滑，并确保每一帧四个点的 dx, dy 变化量一致。
+
     参数：
     - tracked_points：list，每个元素为一帧跟踪到的4个点（格式：[(x,y), ...]）。
     - window_length：Savitzky-Golay 滤波窗口大小，默认21。
     - polyorder：多项式阶数，默认2。
-    - sigma：高斯滤波的标准差，默认为1.5（可微调）。
-    
+    - sigma：高斯滤波的标准差，默认1.5。
+
     返回：
-    - 平滑后的轨迹数组，形状 (num_frames, num_points, 2)。
+    - 调整后的轨迹数组，形状 (num_frames, num_points, 2)。
     """
     num_frames = len(tracked_points)
     num_points = len(tracked_points[0])
 
     # 转换为 numpy 数组
-    traj = np.array(tracked_points)
-    smoothed = np.zeros_like(traj)
+    traj = np.array(tracked_points, dtype=np.float32)
+    adjusted = np.zeros_like(traj)
 
+    # **先计算 dx, dy 并调整轨迹，使相邻帧的变化量一致**
+    for t in range(1, num_frames):
+        dx_list = []
+        dy_list = []
+        for i in range(num_points):
+            dx_list.append(traj[t, i, 0] - traj[t - 1, i, 0])
+            dy_list.append(traj[t, i, 1] - traj[t - 1, i, 1])
+
+        # 计算平均 dx, dy
+        avg_dx = np.mean(dx_list)
+        avg_dy = np.mean(dy_list)
+
+        # 应用平均 dx, dy 以保持一致运动
+        for i in range(num_points):
+            traj[t, i, 0] = traj[t - 1, i, 0] + avg_dx
+            traj[t, i, 1] = traj[t - 1, i, 1] + avg_dy
+
+    # **然后进行平滑处理**
     for i in range(num_points):
         x_coords = traj[:, i, 0]
         y_coords = traj[:, i, 1]
 
-        # 确保窗口长度是奇数，并且不超过数据长度
+        # 计算 Savitzky-Golay 平滑
         win_len = min(window_length, len(x_coords) // 2 * 2 + 1)
         if win_len < 3:
             win_len = 3  # 确保最小窗口长度
 
-        # Savitzky-Golay 滤波
         smooth_x = savgol_filter(x_coords, window_length=win_len, polyorder=polyorder, mode='nearest')
         smooth_y = savgol_filter(y_coords, window_length=win_len, polyorder=polyorder, mode='nearest')
 
-        # 额外使用高斯滤波进一步平滑
+        # 高斯滤波进一步平滑
         smooth_x = gaussian_filter1d(smooth_x, sigma=sigma)
         smooth_y = gaussian_filter1d(smooth_y, sigma=sigma)
 
-        smoothed[:, i, 0] = smooth_x
-        smoothed[:, i, 1] = smooth_y
+        adjusted[:, i, 0] = smooth_x
+        adjusted[:, i, 1] = smooth_y
 
-    return smoothed
+    return adjusted
+
 
 def plot_trajectories(original_traj, smoothed_traj):
     """
@@ -484,13 +384,13 @@ def main():
     print(f"Tracked points obtained on {len(tracked_points)} frames.")
 
     # 第四步：对跟踪轨迹进行平滑处理
-    smoothed_traj = smooth_trajectories(tracked_points, window_length=29, polyorder=2)
+    smoothed_traj = smooth_trajectories_with_consistent_motion(tracked_points, window_length=21, polyorder=2)
     # 可视化平滑后的轨迹
     plot_trajectories(tracked_points, smoothed_traj)
 
     # 第五步：计算每一帧的 Homography，源点为第一帧校正后的点，目标点为平滑后的轨迹点
     homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_02.json")
+    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_02_7s.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
