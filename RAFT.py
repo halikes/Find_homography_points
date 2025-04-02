@@ -12,7 +12,7 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video_006.mp4', help='Path to target video')
+parser.add_argument('--video_file', type=str, default='data/sample_video_002_7s.mp4', help='Path to target video')
 parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
@@ -106,9 +106,9 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
     # source_img
     source_img = np.zeros_like(fused_img)
     source_img[y:y + new_h, x:x + new_w] = cur_obj_img
-    roi = source_img[y:y + new_h, x:x + new_w]
-    roi_smoothed = cv2.bilateralFilter(roi, d=5, sigmaColor=75, sigmaSpace=75)
-    source_img[y:y + new_h, x:x + new_w] = roi_smoothed  # 注意这里确保区域尺寸一致
+    #roi = source_img[y:y + new_h, x:x + new_w]
+    #roi_smoothed = cv2.bilateralFilter(roi, d=5, sigmaColor=75, sigmaSpace=75)
+    #source_img[y:y + new_h, x:x + new_w] = roi_smoothed  # 注意这里确保区域尺寸一致
     mask_img = source_img.copy()
     mask_img[mask_img > 0] = 255
 
@@ -118,8 +118,8 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         "object_size": {"w": new_w, "h": new_h}
     }
 
-    cv2.imwrite(os.path.join(output_dir, "source_img_sample_video_06.png"), source_img)
-    cv2.imwrite(os.path.join(output_dir, "mask_img_sample_video_06.png"), mask_img)
+    cv2.imwrite(os.path.join(output_dir, "source_img_sample_video_02_7s_1.png"), source_img)
+    cv2.imwrite(os.path.join(output_dir, "mask_img_sample_video_02_7s_1.png"), mask_img)
 
     return fused_img, source_img, mask_img, final_params, orig_frame
 
@@ -357,6 +357,50 @@ def compute_homography_for_frames(src_points, smoothed_traj):
         homography_results.append({"frame_idx": idx, "homography_matrix": H.tolist()})
     return homography_results
 
+# ------------------ Evaluate Homography --------------
+
+def evaluate_homographies(homographies, src_pts, gt_traj):
+    """
+    对多个 homography 进行评估。
+    
+    homographies: List of H matrices (N, 3x3)
+    src_pts: shape (4, 2) 初始四个点坐标
+    gt_traj: shape (N, 4, 2) 每一帧的 ground-truth 四边形坐标（来自光流区域追踪）
+
+    Returns:
+        - errors: 每帧的平均 MSE
+        - max_errors: 每帧的最大角点误差
+    """
+    src_pts = np.array(src_pts, dtype=np.float32).reshape(-1, 1, 2)
+    gt_traj = np.array(gt_traj, dtype=np.float32)
+
+    errors = []
+    max_errors = []
+
+    for i, H in enumerate(homographies):
+        H = np.array(H, dtype=np.float32)
+        pred_pts = cv2.perspectiveTransform(src_pts, H).reshape(-1, 2)
+        gt_pts = gt_traj[i]
+
+        frame_errors = np.linalg.norm(pred_pts - gt_pts, axis=1)
+        errors.append(np.mean(frame_errors))
+        max_errors.append(np.max(frame_errors))
+
+    return errors, max_errors
+
+def plot_homography_errors(errors, max_errors=None):
+    plt.figure(figsize=(12, 5))
+    plt.plot(errors, label='Average Corner Error (px)', linewidth=2)
+    if max_errors is not None:
+        plt.plot(max_errors, label='Max Corner Error (px)', linestyle='--', alpha=0.7)
+    plt.title('Homography Projection Error per Frame')
+    plt.xlabel('Frame Index')
+    plt.ylabel('Pixel Error')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
 # ----------------------- 主程序 -----------------------
 def main():
     print("Starting interactive insertion...")
@@ -375,14 +419,27 @@ def main():
     tracked_regions = track_region_dense(args.video_file, corrected_src_points, resize_dim, visualize=True)
     print(f"Tracked regions obtained on {len(tracked_regions)} frames.")
 
-    smoothed_traj = smooth_trajectories(tracked_regions, window_length=15, polyorder=2)
+    smoothed_traj = smooth_trajectories(tracked_regions, window_length=21, polyorder=2)
     plot_trajectories(tracked_regions, smoothed_traj)
 
     homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_06_raft.json")
+    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_02_7s_raft.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
+
+    # 使用你原来的 src 起始角点（如 corrected_src_points）
+    src_pts = corrected_src_points  # shape: (4, 2)
+    gt_traj = tracked_regions       # shape: (N, 4, 2)
+    h_list = [np.array(h['homography_matrix']) for h in homography_results]
+
+    # 评估
+    errors, max_errors = evaluate_homographies(h_list, src_pts, gt_traj)
+    plot_homography_errors(errors, max_errors)
+
+    # 也可以打印均值：
+    print(f"Mean Homography Corner Error: {np.mean(errors):.2f}px")
+    print(f"Max per-frame error: {np.max(max_errors):.2f}px")
 
 if __name__ == "__main__":
     main()
