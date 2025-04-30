@@ -184,132 +184,98 @@ def flow_to_color(flow, multiplier=50):
     bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     return bgr
 
-# 使用 RAFT 光流直接对 4 个角点进行帧间变换跟踪
 
-def track_region_dense(video_file, region_points, resize_dim, visualize=False):
+def flow_consistency_check(flow_fw, flow_bw, threshold=1.0):
     """
-    利用 RAFT 计算密集光流，在每帧中：
-      1. 根据用户标记的四个点构成区域，生成多边形掩码；
-      2. 从光流场中提取该区域内所有像素的流向，采用中位数计算整体位移；
-      3. 如果整体位移幅值小于 motion_threshold，则认为区域静止，不更新区域位置；
-      4. 否则，将该位移更新到区域的四个角点；
-      5. 保存每帧的光流颜色图，便于调试。
+    计算 forward-backward consistency mask
+    flow_fw: flow_{t→t+1}
+    flow_bw: flow_{t+1→t}
     """
-    motion_threshold = 0.1  # 如果中位数位移低于该阈值，则认为区域静止
+    h, w = flow_fw.shape[:2]
+    y, x = np.mgrid[0:h, 0:w]
+    coords = np.stack([x, y], axis=-1).astype(np.float32)
+    coords_fw = coords + flow_fw
+    coords_fw_clipped = np.clip(coords_fw, 0, [w-1, h-1])
+    
+    # sample flow_bw 在 coords_fw 上
+    map_x = coords_fw_clipped[..., 0].astype(np.float32)
+    map_y = coords_fw_clipped[..., 1].astype(np.float32)
+    flow_bw_sampled = cv2.remap(flow_bw, map_x, map_y, interpolation=cv2.INTER_LINEAR)
+    
+    cycle_error = np.linalg.norm(flow_bw_sampled + flow_fw, axis=2)
+    mask = (cycle_error < threshold).astype(np.uint8)
+    return mask
+
+def track_region_dense_consistent(video_file, region_points, resize_dim, visualize=False):
+    motion_threshold = 0.1
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
-    RAFT = RAFT.eval()
+    RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT).to(device).eval()
 
     cap = cv2.VideoCapture(video_file)
-    tracked_regions = []  # 每帧的区域四个角点列表
+    tracked_regions = []
+
     ret, frame1 = cap.read()
     if not ret:
-        cap.release()
-        return tracked_regions
+        return []
     frame1 = cv2.resize(frame1, resize_dim)
     prev_frame = frame1.copy()
-
-    # 初始化区域点（4个点，格式：[(x,y), ...]）
-    region_pts = np.array(region_points, dtype=np.float32)  # shape (4, 2)
+    region_pts = np.array(region_points, dtype=np.float32)
     tracked_regions.append(region_pts.tolist())
 
-    # 创建调试目录保存光流图
-    debug_dir = os.path.join(args.output_dir, "flow_debug")
-    os.makedirs(debug_dir, exist_ok=True)
-
     frame_idx = 0
-    if visualize:
-        window_name = "Region Tracking"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, resize_dim[0], resize_dim[1])
+    last_valid_pts = region_pts.copy()
 
     while True:
         ret, frame2 = cap.read()
         if not ret:
             break
         frame2 = cv2.resize(frame2, resize_dim)
-        
-        # 转换为 tensor 并归一化
+
         prev_tensor = torch.tensor(prev_frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
         next_tensor = torch.tensor(frame2, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
-        prev_tensor = prev_tensor.to(device)
-        next_tensor = next_tensor.to(device)
-        
         with torch.no_grad():
-            flows = RAFT(prev_tensor, next_tensor)
-            flow = flows[-1]
-        flow = flow.squeeze(0).detach().cpu().numpy().transpose(1, 2, 0)  # (H, W, 2)
+            flow_list = RAFT(prev_tensor.to(device), next_tensor.to(device))
+            flow_fw = flow_list[-1][0].detach().cpu().numpy().transpose(1, 2, 0)
 
-        # 保存当前帧光流颜色图
-        flow_color = flow_to_color(flow, multiplier=50)
-        # cv2.imwrite(os.path.join(debug_dir, f"flow_frame_{frame_idx:04d}.png"), flow_color)
+            flow_list_bw = RAFT(next_tensor.to(device), prev_tensor.to(device))
+            flow_bw = flow_list_bw[-1][0].detach().cpu().numpy().transpose(1, 2, 0)
 
-        # 根据当前区域点生成多边形掩码
+        # 一致性检查（optional）
+        consistency_mask = flow_consistency_check(flow_fw, flow_bw)
+        if np.mean(consistency_mask) < 0.6:
+            print(f"Frame {frame_idx}: low consistency, skipping update")
+            tracked_regions.append(last_valid_pts.tolist())
+            prev_frame = frame2.copy()
+            frame_idx += 1
+            continue
+
+        # 区域掩码提取光流
         mask = np.zeros((resize_dim[1], resize_dim[0]), dtype=np.uint8)
-        pts = region_pts.reshape((-1, 1, 2)).astype(np.int32)
-        cv2.fillPoly(mask, [pts], 255)
-        # 提取区域内的光流向量
-        region_flow = flow[mask == 255]  # shape (N, 2)
-        if region_flow.size == 0:
-            displacement = np.array([0, 0], dtype=np.float32)
-        else:
-            displacement = np.median(region_flow, axis=0)
-            
-        # 如果整体位移小于阈值，则认为区域静止
-        
-        if np.linalg.norm(displacement) < motion_threshold:
-            print(f"Frame {frame_idx}: displacement {displacement} below threshold, no update")
-            displacement = np.array([0, 0], dtype=np.float32)
-        else:
-            print(f"Frame {frame_idx}: displacement = {displacement}")
-        # 更新区域点
-        # region_pts = region_pts + displacement
-        # step 1: 获取光流区域 mask
-        mask = np.zeros((resize_dim[1], resize_dim[0]), dtype=np.uint8)
-        pts = region_pts.reshape((-1, 1, 2)).astype(np.int32)
-        cv2.fillPoly(mask, [pts], 255)
-
-        # step 2: 提取掩码内所有点的位置 和 它们的流动向量
+        cv2.fillPoly(mask, [region_pts.astype(np.int32).reshape((-1, 1, 2))], 255)
         ys, xs = np.where(mask == 255)
-        pts1 = np.stack([xs, ys], axis=-1).astype(np.float32)  # shape: (N, 2)
-        flows = flow[ys, xs]  # shape: (N, 2)
+        pts1 = np.stack([xs, ys], axis=-1).astype(np.float32)
+        flows = flow_fw[ys, xs]
         pts2 = pts1 + flows
 
-        # step 3: 用这些点对估计仿射 or 单应矩阵
-        # 建议优先用仿射，更稳定（如果变形不严重）
-        H, inliers = cv2.estimateAffine2D(pts1, pts2, method=cv2.RANSAC, ransacReprojThreshold=3)
+        H, _ = cv2.estimateAffine2D(pts1, pts2, method=cv2.RANSAC)
+        if H is not None:
+            region_pts = cv2.transform(region_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
+            last_valid_pts = region_pts.copy()
+        else:
+            print(f"Frame {frame_idx}: affine failed")
+            region_pts = last_valid_pts.copy()
 
-        if H is None:
-            print(f"Frame {frame_idx}: affine estimation failed")
-            H = np.eye(2, 3, dtype=np.float32)  # fallback
-
-        # step 4: 用这个 H 统一变换四个角点
-        region_pts = cv2.transform(region_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
-        """
-        # 每个角点局部平均光流更新
-        new_region_pts = []
-        for pt in region_pts:
-            x, y = int(pt[0]), int(pt[1])
-            x0, x1 = max(0, x - 2), min(resize_dim[0], x + 3)
-            y0, y1 = max(0, y - 2), min(resize_dim[1], y + 3)
-            local_flow = flow[y0:y1, x0:x1].reshape(-1, 2)
-            avg_flow = np.mean(local_flow, axis=0)
-            new_pt = pt + avg_flow
-            new_region_pts.append(new_pt)
-        region_pts = np.array(new_region_pts, dtype=np.float32)
-        """
         tracked_regions.append(region_pts.tolist())
+
+        if visualize:
+            vis = frame2.copy()
+            cv2.polylines(vis, [region_pts.astype(np.int32).reshape((-1, 1, 2))], True, (0, 255, 0), 2)
+            cv2.imshow("Track", vis)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
         prev_frame = frame2.copy()
         frame_idx += 1
-        
-        if visualize:
-            vis_frame = frame2.copy()
-            pts_draw = region_pts.reshape((-1, 1, 2)).astype(np.int32)
-            cv2.polylines(vis_frame, [pts_draw], isClosed=True, color=(0, 255, 0), thickness=2)
-            cv2.imshow(window_name, vis_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
 
     cap.release()
     if visualize:
@@ -569,6 +535,26 @@ def plot_homography_errors(errors, max_errors=None):
     plt.tight_layout()
     plt.show()
 
+def regularize_homographies(homographies, alpha=0.5):
+    """
+    对 homography 进行时间一致性正则化，避免 jitter。
+    alpha 越大，越保留上一帧特征，越平稳。
+    """
+    smoothed = [np.array(homographies[0]["homography_matrix"], dtype=np.float32)]
+    for i in range(1, len(homographies)):
+        H_prev = smoothed[-1]
+        H_curr = np.array(homographies[i]["homography_matrix"], dtype=np.float32)
+        H_smooth = alpha * H_prev + (1 - alpha) * H_curr
+        smoothed.append(H_smooth)
+
+    result = []
+    for i, H in enumerate(smoothed):
+        result.append({
+            "frame_idx": i,
+            "homography_matrix": H.tolist()
+        })
+    return result
+
 # ----------------------- 主程序 -----------------------
 def main():
     print("Starting interactive insertion...")
@@ -584,8 +570,10 @@ def main():
 
     # 使用用户选取的区域作为初始区域
     resize_dim = (orig_frame.shape[1], orig_frame.shape[0])
-    tracked_regions = track_region_dense(args.video_file, corrected_src_points, resize_dim, visualize=True)
-    print(f"Tracked regions obtained on {len(tracked_regions)} frames.")
+
+    tracked_regions = track_region_dense_consistent(
+        args.video_file, corrected_src_points, resize_dim, visualize=True
+    )
 
     smoothed_traj = smooth_trajectories_with_kalman_and_savgol(tracked_regions, method="kalman",window_length=21, polyorder=2)
     plot_trajectories(tracked_regions, smoothed_traj)
@@ -593,23 +581,15 @@ def main():
     #homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
     homography_results, refined_traj = compute_homography_with_residual_regularization(
         corrected_src_points, tracked_regions, smooth_method='savgol', window_length=21, polyorder=2)
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_02_raft_kalman_1--new.json")
+    
+    #print("Regularizing homography sequence for temporal smoothness...")
+    #homography_results = regularize_homographies(homography_results, alpha=0.3)
+
+    homography_json = os.path.join(args.output_dir, "flow_consist_regularize.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
 
-    # 使用你原来的 src 起始角点（如 corrected_src_points）
-#    src_pts = corrected_src_points  # shape: (4, 2)
-#    gt_traj = tracked_regions       # shape: (N, 4, 2)
-#    h_list = [np.array(h['homography_matrix']) for h in homography_results]
-    
-    # 评估
-#    errors, max_errors = evaluate_homographies(h_list, src_pts, gt_traj)
-#    plot_homography_errors(errors, max_errors)
-
-    # 也可以打印均值：
-#    print(f"Mean Homography Corner Error: {np.mean(errors):.2f}px")
-#    print(f"Max per-frame error: {np.max(max_errors):.2f}px")
 
 if __name__ == "__main__":
     main()
