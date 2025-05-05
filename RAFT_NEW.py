@@ -12,7 +12,7 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video_002_7s.mp4', help='Path to target video')
+parser.add_argument('--video_file', type=str, default='data/sample_video.mp4', help='Path to target video')
 parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
@@ -569,6 +569,43 @@ def plot_homography_errors(errors, max_errors=None):
     plt.tight_layout()
     plt.show()
 
+
+#------追加的函数：平滑轨迹和可视化------
+def analyze_H_drift(homographies, src_pts):
+    src_pts = np.array(src_pts, dtype=np.float32).reshape(-1, 1, 2)
+    drift_norms = []
+    proj_pts_list = []
+    last_proj = cv2.perspectiveTransform(src_pts, np.array(homographies[0]['homography_matrix']))
+    proj_pts_list.append(last_proj.squeeze(1))
+    for i in range(1, len(homographies)):
+        curr_proj = cv2.perspectiveTransform(src_pts, np.array(homographies[i]['homography_matrix']))
+        jump = np.linalg.norm(curr_proj - last_proj, axis=2).mean()
+        drift_norms.append(jump)
+        last_proj = curr_proj
+        proj_pts_list.append(curr_proj.squeeze(1))
+    return drift_norms, proj_pts_list
+
+def plot_H_drift(drift_norms, threshold=1.0):
+    plt.figure(figsize=(10, 4))
+    plt.plot(drift_norms, label='Avg corner drift')
+    plt.axhline(y=threshold, color='r', linestyle='--', label='Threshold')
+    plt.xlabel('Frame')
+    plt.ylabel('Geometric drift (px)')
+    plt.title('Frame-to-frame Homography Drift')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+def smooth_homography_sequence(h_list, alpha=0.9):
+    smoothed = [h_list[0]]
+    for i in range(1, len(h_list)):
+        H_prev = smoothed[-1]
+        H_curr = h_list[i]
+        H_smooth = alpha * H_prev + (1 - alpha) * H_curr
+        smoothed.append(H_smooth)
+    return smoothed
+
 # ----------------------- 主程序 -----------------------
 def main():
     print("Starting interactive insertion...")
@@ -588,16 +625,47 @@ def main():
     print(f"Tracked regions obtained on {len(tracked_regions)} frames.")
 
     smoothed_traj = smooth_trajectories_with_kalman_and_savgol(tracked_regions, method="kalman",window_length=21, polyorder=2)
+
     plot_trajectories(tracked_regions, smoothed_traj)
 
     #homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
     homography_results, refined_traj = compute_homography_with_residual_regularization(
         corrected_src_points, tracked_regions, smooth_method='savgol', window_length=21, polyorder=2)
-    homography_json = os.path.join(args.output_dir, "global_homography_results_sample_video_02_raft_kalman_1--new.json")
+    homography_json = os.path.join(args.output_dir, "sample_video.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
 
+    
+    h_list = [np.array(h["homography_matrix"]) for h in homography_results]
+    drift_norms, proj_pts_list = analyze_H_drift(homography_results, corrected_src_points)
+    plot_H_drift(drift_norms)
+    print(f"Max drift: {np.max(drift_norms):.2f}px, Mean: {np.mean(drift_norms):.2f}px")
+
+    drift_thresh = 1.0  # px
+    if np.max(drift_norms) > drift_thresh:
+        print("⚠️ Detected high drift. Applying H smoothing filter...")
+        h_list_smooth = smooth_homography_sequence(h_list, alpha=0.9)
+        homography_results = [
+            {"frame_idx": i, "homography_matrix": H.tolist()} for i, H in enumerate(h_list_smooth)
+        ]
+
+        # 平滑后的投影点重新计算并可视化
+        new_proj_pts_list = []
+        src_pts_arr = np.array(corrected_src_points, dtype=np.float32).reshape(-1, 1, 2)
+        for H in h_list_smooth:
+            new_proj = cv2.perspectiveTransform(src_pts_arr, H)
+            new_proj_pts_list.append(new_proj.squeeze(1))
+
+        plt.figure(figsize=(8, 8))
+        for pts in proj_pts_list:
+            plt.plot(pts[:, 0], pts[:, 1], color='gray', alpha=0.3)
+        for pts in new_proj_pts_list:
+            plt.plot(pts[:, 0], pts[:, 1], color='green', linestyle='--', alpha=0.5)
+        plt.title("Corner Trajectories Before (gray) and After (green dashed) Smoothing")
+        plt.gca().invert_yaxis()
+        plt.grid(True)
+        plt.show()
     # 使用你原来的 src 起始角点（如 corrected_src_points）
 #    src_pts = corrected_src_points  # shape: (4, 2)
 #    gt_traj = tracked_regions       # shape: (N, 4, 2)
