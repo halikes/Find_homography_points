@@ -106,9 +106,7 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
     # source_img
     source_img = np.zeros_like(fused_img)
     source_img[y:y + new_h, x:x + new_w] = cur_obj_img
-    #roi = source_img[y:y + new_h, x:x + new_w]
-    #roi_smoothed = cv2.bilateralFilter(roi, d=5, sigmaColor=75, sigmaSpace=75)
-    #source_img[y:y + new_h, x:x + new_w] = roi_smoothed  # 注意这里确保区域尺寸一致
+    
     mask_img = source_img.copy()
     mask_img[mask_img > 0] = 255
 
@@ -168,11 +166,7 @@ def select_and_correct_points(frame):
 
 # ----------------------- 光流区域跟踪模块 -----------------------
 def flow_to_color(flow, multiplier=50):
-    """
-    将光流（H, W, 2）转换为颜色编码的BGR图像用于可视化，
-    使用HSV映射：角度对应色调，幅值对应亮度。
-    multiplier 参数用于调节幅值到亮度的映射倍率
-    """
+    
     h, w = flow.shape[:2]
     hsv = np.zeros((h, w, 3), dtype=np.uint8)
     # 计算幅值和角度
@@ -184,98 +178,125 @@ def flow_to_color(flow, multiplier=50):
     bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     return bgr
 
+# 使用 RAFT 光流直接对 4 个角点进行帧间变换跟踪
 
-def flow_consistency_check(flow_fw, flow_bw, threshold=1.0):
-    """
-    计算 forward-backward consistency mask
-    flow_fw: flow_{t→t+1}
-    flow_bw: flow_{t+1→t}
-    """
-    h, w = flow_fw.shape[:2]
-    y, x = np.mgrid[0:h, 0:w]
-    coords = np.stack([x, y], axis=-1).astype(np.float32)
-    coords_fw = coords + flow_fw
-    coords_fw_clipped = np.clip(coords_fw, 0, [w-1, h-1])
+def track_region_dense(video_file, region_points, resize_dim, visualize=False):
     
-    # sample flow_bw 在 coords_fw 上
-    map_x = coords_fw_clipped[..., 0].astype(np.float32)
-    map_y = coords_fw_clipped[..., 1].astype(np.float32)
-    flow_bw_sampled = cv2.remap(flow_bw, map_x, map_y, interpolation=cv2.INTER_LINEAR)
-    
-    cycle_error = np.linalg.norm(flow_bw_sampled + flow_fw, axis=2)
-    mask = (cycle_error < threshold).astype(np.uint8)
-    return mask
-
-def track_region_dense_consistent(video_file, region_points, resize_dim, visualize=False):
-    motion_threshold = 0.1
+    motion_threshold = 0.1  # 如果中位数位移低于该阈值，则认为区域静止
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT).to(device).eval()
+    RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
+    RAFT = RAFT.eval()
 
     cap = cv2.VideoCapture(video_file)
-    tracked_regions = []
-
+    tracked_regions = []  # 每帧的区域四个角点列表
     ret, frame1 = cap.read()
     if not ret:
-        return []
+        cap.release()
+        return tracked_regions
     frame1 = cv2.resize(frame1, resize_dim)
     prev_frame = frame1.copy()
-    region_pts = np.array(region_points, dtype=np.float32)
+
+    # 初始化区域点（4个点，格式：[(x,y), ...]）
+    region_pts = np.array(region_points, dtype=np.float32)  # shape (4, 2)
     tracked_regions.append(region_pts.tolist())
 
+    # 创建调试目录保存光流图
+    debug_dir = os.path.join(args.output_dir, "flow_debug")
+    os.makedirs(debug_dir, exist_ok=True)
+
     frame_idx = 0
-    last_valid_pts = region_pts.copy()
+    if visualize:
+        window_name = "Region Tracking"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, resize_dim[0], resize_dim[1])
 
     while True:
         ret, frame2 = cap.read()
         if not ret:
             break
         frame2 = cv2.resize(frame2, resize_dim)
-
+        
+        # 转换为 tensor 并归一化
         prev_tensor = torch.tensor(prev_frame, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
         next_tensor = torch.tensor(frame2, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
+        prev_tensor = prev_tensor.to(device)
+        next_tensor = next_tensor.to(device)
+        
         with torch.no_grad():
-            flow_list = RAFT(prev_tensor.to(device), next_tensor.to(device))
-            flow_fw = flow_list[-1][0].detach().cpu().numpy().transpose(1, 2, 0)
+            flows = RAFT(prev_tensor, next_tensor)
+            flow = flows[-1]
+        flow = flow.squeeze(0).detach().cpu().numpy().transpose(1, 2, 0)  # (H, W, 2)
 
-            flow_list_bw = RAFT(next_tensor.to(device), prev_tensor.to(device))
-            flow_bw = flow_list_bw[-1][0].detach().cpu().numpy().transpose(1, 2, 0)
+        # 保存当前帧光流颜色图
+        flow_color = flow_to_color(flow, multiplier=50)
+        # cv2.imwrite(os.path.join(debug_dir, f"flow_frame_{frame_idx:04d}.png"), flow_color)
 
-        # 一致性检查（optional）
-        consistency_mask = flow_consistency_check(flow_fw, flow_bw)
-        if np.mean(consistency_mask) < 0.6:
-            print(f"Frame {frame_idx}: low consistency, skipping update")
-            tracked_regions.append(last_valid_pts.tolist())
-            prev_frame = frame2.copy()
-            frame_idx += 1
-            continue
-
-        # 区域掩码提取光流
+        # 根据当前区域点生成多边形掩码
         mask = np.zeros((resize_dim[1], resize_dim[0]), dtype=np.uint8)
-        cv2.fillPoly(mask, [region_pts.astype(np.int32).reshape((-1, 1, 2))], 255)
+        pts = region_pts.reshape((-1, 1, 2)).astype(np.int32)
+        cv2.fillPoly(mask, [pts], 255)
+        # 提取区域内的光流向量
+        region_flow = flow[mask == 255]  # shape (N, 2)
+        if region_flow.size == 0:
+            displacement = np.array([0, 0], dtype=np.float32)
+        else:
+            displacement = np.median(region_flow, axis=0)
+            
+        # 如果整体位移小于阈值，则认为区域静止
+        
+        if np.linalg.norm(displacement) < motion_threshold:
+            print(f"Frame {frame_idx}: displacement {displacement} below threshold, no update")
+            displacement = np.array([0, 0], dtype=np.float32)
+        else:
+            print(f"Frame {frame_idx}: displacement = {displacement}")
+        # 更新区域点
+        # region_pts = region_pts + displacement
+        # step 1: 获取光流区域 mask
+        mask = np.zeros((resize_dim[1], resize_dim[0]), dtype=np.uint8)
+        pts = region_pts.reshape((-1, 1, 2)).astype(np.int32)
+        cv2.fillPoly(mask, [pts], 255)
+
+        # step 2: 提取掩码内所有点的位置 和 它们的流动向量
         ys, xs = np.where(mask == 255)
-        pts1 = np.stack([xs, ys], axis=-1).astype(np.float32)
-        flows = flow_fw[ys, xs]
+        pts1 = np.stack([xs, ys], axis=-1).astype(np.float32)  # shape: (N, 2)
+        flows = flow[ys, xs]  # shape: (N, 2)
         pts2 = pts1 + flows
 
-        H, _ = cv2.estimateAffine2D(pts1, pts2, method=cv2.RANSAC)
-        if H is not None:
-            region_pts = cv2.transform(region_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
-            last_valid_pts = region_pts.copy()
+        # step 2.5: 光流一致性筛选
+        flow_mean = np.mean(flows, axis=0)
+        flow_std = np.std(flows, axis=0)
+        flow_dist = np.linalg.norm(flows - flow_mean, axis=1)
+        mask_consistent = flow_dist < 1.5 * np.linalg.norm(flow_std)
+
+        # 筛选出一致的点对用于H估计
+        pts1_f = pts1[mask_consistent]
+        pts2_f = pts2[mask_consistent]
+
+        if len(pts1_f) < 4:  # 如果太少就跳过（避免退化）
+            print(f"Frame {frame_idx}: too few consistent points, skipping H update.")
+            H = np.eye(2, 3, dtype=np.float32)
         else:
-            print(f"Frame {frame_idx}: affine failed")
-            region_pts = last_valid_pts.copy()
+            H, inliers = cv2.estimateAffine2D(pts1_f, pts2_f, method=cv2.RANSAC, ransacReprojThreshold=3)
+            if H is None:
+                print(f"Frame {frame_idx}: affine estimation failed")
+                H = np.eye(2, 3, dtype=np.float32)
 
+
+        # step 4: 用这个 H 统一变换四个角点
+        region_pts = cv2.transform(region_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
+        
         tracked_regions.append(region_pts.tolist())
-
-        if visualize:
-            vis = frame2.copy()
-            cv2.polylines(vis, [region_pts.astype(np.int32).reshape((-1, 1, 2))], True, (0, 255, 0), 2)
-            cv2.imshow("Track", vis)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
 
         prev_frame = frame2.copy()
         frame_idx += 1
+        
+        if visualize:
+            vis_frame = frame2.copy()
+            pts_draw = region_pts.reshape((-1, 1, 2)).astype(np.int32)
+            cv2.polylines(vis_frame, [pts_draw], isClosed=True, color=(0, 255, 0), thickness=2)
+            cv2.imshow(window_name, vis_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
     cap.release()
     if visualize:
@@ -535,25 +556,203 @@ def plot_homography_errors(errors, max_errors=None):
     plt.tight_layout()
     plt.show()
 
-def regularize_homographies(homographies, alpha=0.5):
-    """
-    对 homography 进行时间一致性正则化，避免 jitter。
-    alpha 越大，越保留上一帧特征，越平稳。
-    """
-    smoothed = [np.array(homographies[0]["homography_matrix"], dtype=np.float32)]
+
+#------追加的函数：平滑轨迹和可视化------
+def analyze_H_drift(homographies, src_pts):
+    src_pts = np.array(src_pts, dtype=np.float32).reshape(-1, 1, 2)
+    drift_norms = []
+    proj_pts_list = []
+    last_proj = cv2.perspectiveTransform(src_pts, np.array(homographies[0]['homography_matrix']))
+    proj_pts_list.append(last_proj.squeeze(1))
     for i in range(1, len(homographies)):
+        curr_proj = cv2.perspectiveTransform(src_pts, np.array(homographies[i]['homography_matrix']))
+        jump = np.linalg.norm(curr_proj - last_proj, axis=2).mean()
+        drift_norms.append(jump)
+        last_proj = curr_proj
+        proj_pts_list.append(curr_proj.squeeze(1))
+    return drift_norms, proj_pts_list
+
+def plot_H_drift(drift_norms, threshold=1.0):
+    plt.figure(figsize=(10, 4))
+    plt.plot(drift_norms, label='Avg corner drift')
+    plt.axhline(y=threshold, color='r', linestyle='--', label='Threshold')
+    plt.xlabel('Frame')
+    plt.ylabel('Geometric drift (px)')
+    plt.title('Frame-to-frame Homography Drift')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+def smooth_homography_sequence(h_list, alpha=0.9):
+    smoothed = [h_list[0]]
+    for i in range(1, len(h_list)):
         H_prev = smoothed[-1]
-        H_curr = np.array(homographies[i]["homography_matrix"], dtype=np.float32)
+        H_curr = h_list[i]
         H_smooth = alpha * H_prev + (1 - alpha) * H_curr
         smoothed.append(H_smooth)
+    return smoothed
 
-    result = []
-    for i, H in enumerate(smoothed):
-        result.append({
-            "frame_idx": i,
-            "homography_matrix": H.tolist()
+def compute_edge_map(binary_mask):
+    edges = cv2.Canny(binary_mask, 100, 200)
+    return edges.astype(np.float32) / 255.0  # Normalize
+
+def compute_edge_consistency_loss(ref_edge, warped_edges):
+    losses = []
+    for i, edge in enumerate(warped_edges):
+        # L1 距离
+        l1 = np.mean(np.abs(ref_edge - edge))
+        losses.append(l1)
+    return losses
+
+def refine_homographies_with_edge_loss(homographies, ref_edge, mask_size, threshold=0.002):
+    """
+    对高边缘漂移的帧进行 homography 微调，使其边缘更一致
+    """
+    refined = []
+    for i, h_entry in enumerate(homographies):
+        H = np.array(h_entry['homography_matrix'])
+        warped = cv2.warpPerspective(ref_edge, H, mask_size)
+        loss = np.mean(np.abs(warped - ref_edge))
+
+        if loss < threshold:
+            refined.append(h_entry)
+            continue
+
+        # 优化策略：微调 H 的平移部分，减小边缘误差（可扩展为更多参数优化）
+        best_loss = loss
+        best_H = H.copy()
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                delta = np.eye(3, dtype=np.float32)
+                delta[0, 2] += dx
+                delta[1, 2] += dy
+                H_new = delta @ H
+                warped_new = cv2.warpPerspective(ref_edge, H_new, mask_size)
+                new_loss = np.mean(np.abs(warped_new - ref_edge))
+                if new_loss < best_loss:
+                    best_loss = new_loss
+                    best_H = H_new
+        refined.append({"frame_idx": i, "homography_matrix": best_H.tolist()})
+    return refined
+
+def refine_homographies_with_temporal_edge_consistency(homographies, ref_edge, mask_size, threshold=0.002, lambda_temporal=0.5):
+    """
+    对高边缘漂移的帧进行 homography 微调，使其边缘更一致，
+    同时加入 temporal smoothness loss（前一帧对齐误差）以抑制跳变。
+    """
+    refined = []
+    prev_warped = None
+    for i, h_entry in enumerate(homographies):
+        H = np.array(h_entry['homography_matrix'])
+        warped = cv2.warpPerspective(ref_edge, H, mask_size)
+        spatial_loss = np.mean(np.abs(warped - ref_edge))
+
+        if prev_warped is not None:
+            temporal_loss = np.mean(np.abs(warped - prev_warped))
+        else:
+            temporal_loss = 0
+
+        total_loss = spatial_loss + lambda_temporal * temporal_loss
+
+        if total_loss < threshold:
+            refined.append(h_entry)
+            prev_warped = warped
+            continue
+
+        # 微调策略：寻找平移扰动以优化 total loss
+        best_loss = total_loss
+        best_H = H.copy()
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                delta = np.eye(3, dtype=np.float32)
+                delta[0, 2] += dx
+                delta[1, 2] += dy
+                H_new = delta @ H
+                warped_new = cv2.warpPerspective(ref_edge, H_new, mask_size)
+                spatial_new = np.mean(np.abs(warped_new - ref_edge))
+                temporal_new = np.mean(np.abs(warped_new - prev_warped)) if prev_warped is not None else 0
+                total_new = spatial_new + lambda_temporal * temporal_new
+                if total_new < best_loss:
+                    best_loss = total_new
+                    best_H = H_new
+        refined.append({"frame_idx": i, "homography_matrix": best_H.tolist()})
+        prev_warped = cv2.warpPerspective(ref_edge, best_H, mask_size)
+    return refined
+
+
+def extract_edge_points(mask):
+    edges = cv2.Canny(mask, 100, 200)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return np.empty((0, 2), dtype=np.float32)
+    contour = max(contours, key=lambda c: len(c))
+    return contour.squeeze(1).astype(np.float32)
+
+def smooth_edge_trajectories(edge_trajectories, window_length=9, polyorder=2):
+    edge_trajectories = np.array(edge_trajectories)
+    num_frames, num_points, _ = edge_trajectories.shape
+    smoothed = np.zeros_like(edge_trajectories)
+    for i in range(num_points):
+        x = edge_trajectories[:, i, 0]
+        y = edge_trajectories[:, i, 1]
+        win_len = window_length if window_length <= len(x) and window_length % 2 == 1 else (len(x) // 2) * 2 + 1
+        smoothed[:, i, 0] = savgol_filter(x, win_len, polyorder)
+        smoothed[:, i, 1] = savgol_filter(y, win_len, polyorder)
+    return smoothed
+
+def refine_homographies_with_edge_structure_preserving(mask, homographies):
+    h, w = mask.shape
+    ref_edge_points = extract_edge_points(mask)
+    if len(ref_edge_points) < 4:
+        raise ValueError("Not enough edge points extracted from mask.")
+
+    all_warped_edges = []
+    for h_entry in homographies:
+        H = np.array(h_entry["homography_matrix"], dtype=np.float32)
+        warped = cv2.perspectiveTransform(ref_edge_points.reshape(-1, 1, 2), H).reshape(-1, 2)
+        all_warped_edges.append(warped)
+
+    all_warped_edges = np.array(all_warped_edges)  # (T, N, 2)
+    smoothed_edges = smooth_edge_trajectories(all_warped_edges)
+
+    refined_homographies = []
+    for t in range(len(homographies)):
+        dst = smoothed_edges[t].reshape(-1, 1, 2)
+        src = ref_edge_points.reshape(-1, 1, 2)
+        H_new, _ = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+        if H_new is None:
+            H_new = np.eye(3, dtype=np.float32)
+        refined_homographies.append({
+            "frame_idx": t,
+            "homography_matrix": H_new.tolist()
         })
-    return result
+
+    return refined_homographies
+
+
+def compute_temporal_edge_consistency(mask, homographies, edge_threshold=100):
+    """
+    分析 mask 经 homography warp 后的边缘随时间的变化是否平滑。
+    """
+    ref_edge = compute_edge_map(mask)  # (H, W)
+    prev_edge = None
+    temporal_losses = []
+
+    for i, h_entry in enumerate(homographies):
+        H = np.array(h_entry["homography_matrix"])
+        warped_edge = cv2.warpPerspective(ref_edge, H, (mask.shape[1], mask.shape[0]))
+        warped_edge = (warped_edge > 0.1).astype(np.uint8)
+
+        if prev_edge is not None:
+            # 差异：边缘前后帧之间的异同区域（L1 或 IOU）
+            diff = np.abs(warped_edge.astype(np.float32) - prev_edge.astype(np.float32))
+            temporal_loss = np.mean(diff)
+            temporal_losses.append(temporal_loss)
+
+        prev_edge = warped_edge
+
+    return temporal_losses
 
 # ----------------------- 主程序 -----------------------
 def main():
@@ -570,26 +769,71 @@ def main():
 
     # 使用用户选取的区域作为初始区域
     resize_dim = (orig_frame.shape[1], orig_frame.shape[0])
-
-    tracked_regions = track_region_dense_consistent(
-        args.video_file, corrected_src_points, resize_dim, visualize=True
-    )
+    tracked_regions = track_region_dense(args.video_file, corrected_src_points, resize_dim, visualize=True)
+    print(f"Tracked regions obtained on {len(tracked_regions)} frames.")
 
     smoothed_traj = smooth_trajectories_with_kalman_and_savgol(tracked_regions, method="kalman",window_length=21, polyorder=2)
+
     plot_trajectories(tracked_regions, smoothed_traj)
 
     #homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
     homography_results, refined_traj = compute_homography_with_residual_regularization(
         corrected_src_points, tracked_regions, smooth_method='savgol', window_length=21, polyorder=2)
     
-    #print("Regularizing homography sequence for temporal smoothness...")
-    #homography_results = regularize_homographies(homography_results, alpha=0.3)
+    print("🔍 Computing *temporal* edge consistency across frames...")
+    temporal_losses = compute_temporal_edge_consistency(mask_img[..., 0], homography_results)
 
-    homography_json = os.path.join(args.output_dir, "flow_consist_regularize.json")
+    plt.plot(temporal_losses)
+    plt.title("Temporal Edge Consistency Loss (Frame-to-Frame)")
+    plt.xlabel("Frame Index")
+    plt.ylabel("Mean Edge Change")
+    plt.grid(True)
+    plt.show()
+
+    print(f"📉 Mean Temporal Edge Change: {np.mean(temporal_losses):.4f}")
+    
+    # Step: 基于边缘 loss 的 Homography 微调
+    print(" Refining homographies with edge consistency...")
+    #homography_results = refine_homographies_with_edge_structure_preserving(mask_img, homography_results)
+
+    homography_json = os.path.join(args.output_dir, "sample_video_002_7s_refine_edge_no_fine_tuning_H.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
 
+    
+    h_list = [np.array(h["homography_matrix"]) for h in homography_results]
+    drift_norms, proj_pts_list = analyze_H_drift(homography_results, corrected_src_points)
+    plot_H_drift(drift_norms)
+    print(f"Max drift: {np.max(drift_norms):.2f}px, Mean: {np.mean(drift_norms):.2f}px")
+
+    drift_thresh = 1.0  # px
+    if np.max(drift_norms) > drift_thresh:
+        print(" Detected high drift. Applying H smoothing filter...")
+        h_list_smooth = smooth_homography_sequence(h_list, alpha=0.9)
+        homography_results = [
+            {"frame_idx": i, "homography_matrix": H.tolist()} for i, H in enumerate(h_list_smooth)
+        ]
+
+        # 平滑后的投影点重新计算并可视化
+        new_proj_pts_list = []
+        src_pts_arr = np.array(corrected_src_points, dtype=np.float32).reshape(-1, 1, 2)
+        for H in h_list_smooth:
+            new_proj = cv2.perspectiveTransform(src_pts_arr, H)
+            new_proj_pts_list.append(new_proj.squeeze(1))
+
+        plt.figure(figsize=(8, 8))
+        for pts in proj_pts_list:
+            plt.plot(pts[:, 0], pts[:, 1], color='gray', alpha=0.3)
+        for pts in new_proj_pts_list:
+            plt.plot(pts[:, 0], pts[:, 1], color='green', linestyle='--', alpha=0.5)
+        plt.title("Corner Trajectories Before (gray) and After (green dashed) Smoothing")
+        plt.gca().invert_yaxis()
+        plt.grid(True)
+        plt.show()
+    
+    drift_norms, proj_pts_list = analyze_H_drift(homography_results, corrected_src_points)
+    plot_H_drift(drift_norms)
 
 if __name__ == "__main__":
     main()

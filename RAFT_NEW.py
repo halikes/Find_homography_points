@@ -12,7 +12,7 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video.mp4', help='Path to target video')
+parser.add_argument('--video_file', type=str, default='data/sample_video_002_7s.mp4', help='Path to target video')
 parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
@@ -106,9 +106,7 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
     # source_img
     source_img = np.zeros_like(fused_img)
     source_img[y:y + new_h, x:x + new_w] = cur_obj_img
-    #roi = source_img[y:y + new_h, x:x + new_w]
-    #roi_smoothed = cv2.bilateralFilter(roi, d=5, sigmaColor=75, sigmaSpace=75)
-    #source_img[y:y + new_h, x:x + new_w] = roi_smoothed  # 注意这里确保区域尺寸一致
+    
     mask_img = source_img.copy()
     mask_img[mask_img > 0] = 255
 
@@ -168,11 +166,7 @@ def select_and_correct_points(frame):
 
 # ----------------------- 光流区域跟踪模块 -----------------------
 def flow_to_color(flow, multiplier=50):
-    """
-    将光流（H, W, 2）转换为颜色编码的BGR图像用于可视化，
-    使用HSV映射：角度对应色调，幅值对应亮度。
-    multiplier 参数用于调节幅值到亮度的映射倍率
-    """
+    
     h, w = flow.shape[:2]
     hsv = np.zeros((h, w, 3), dtype=np.uint8)
     # 计算幅值和角度
@@ -187,14 +181,7 @@ def flow_to_color(flow, multiplier=50):
 # 使用 RAFT 光流直接对 4 个角点进行帧间变换跟踪
 
 def track_region_dense(video_file, region_points, resize_dim, visualize=False):
-    """
-    利用 RAFT 计算密集光流，在每帧中：
-      1. 根据用户标记的四个点构成区域，生成多边形掩码；
-      2. 从光流场中提取该区域内所有像素的流向，采用中位数计算整体位移；
-      3. 如果整体位移幅值小于 motion_threshold，则认为区域静止，不更新区域位置；
-      4. 否则，将该位移更新到区域的四个角点；
-      5. 保存每帧的光流颜色图，便于调试。
-    """
+    
     motion_threshold = 0.1  # 如果中位数位移低于该阈值，则认为区域静止
     device = "cuda" if torch.cuda.is_available() else "cpu"
     RAFT = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(device)
@@ -285,19 +272,7 @@ def track_region_dense(video_file, region_points, resize_dim, visualize=False):
 
         # step 4: 用这个 H 统一变换四个角点
         region_pts = cv2.transform(region_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
-        """
-        # 每个角点局部平均光流更新
-        new_region_pts = []
-        for pt in region_pts:
-            x, y = int(pt[0]), int(pt[1])
-            x0, x1 = max(0, x - 2), min(resize_dim[0], x + 3)
-            y0, y1 = max(0, y - 2), min(resize_dim[1], y + 3)
-            local_flow = flow[y0:y1, x0:x1].reshape(-1, 2)
-            avg_flow = np.mean(local_flow, axis=0)
-            new_pt = pt + avg_flow
-            new_region_pts.append(new_pt)
-        region_pts = np.array(new_region_pts, dtype=np.float32)
-        """
+        
         tracked_regions.append(region_pts.tolist())
 
         prev_frame = frame2.copy()
@@ -606,6 +581,19 @@ def smooth_homography_sequence(h_list, alpha=0.9):
         smoothed.append(H_smooth)
     return smoothed
 
+def compute_edge_map(binary_mask):
+    edges = cv2.Canny(binary_mask, 100, 200)
+    return edges.astype(np.float32) / 255.0  # Normalize
+
+def compute_edge_consistency_loss(ref_edge, warped_edges):
+    losses = []
+    for i, edge in enumerate(warped_edges):
+        # L1 距离
+        l1 = np.mean(np.abs(ref_edge - edge))
+        losses.append(l1)
+    return losses
+
+
 # ----------------------- 主程序 -----------------------
 def main():
     print("Starting interactive insertion...")
@@ -631,7 +619,32 @@ def main():
     #homography_results = compute_homography_for_frames(corrected_src_points, smoothed_traj)
     homography_results, refined_traj = compute_homography_with_residual_regularization(
         corrected_src_points, tracked_regions, smooth_method='savgol', window_length=21, polyorder=2)
-    homography_json = os.path.join(args.output_dir, "sample_video.json")
+    
+    # === Step: 插入边缘一致性损失分析 ===
+    print("🔍 Computing edge consistency loss across frames...")
+
+    src_img = source_img
+    mask = mask_img[..., 0]  # 提取灰度掩码
+    ref_edge = compute_edge_map(mask)
+
+    # 遍历每一帧，将原图 mask 用 homography warp 到目标帧
+    warped_edges = []
+    for h_entry in homography_results:
+        H = np.array(h_entry["homography_matrix"])
+        warped = cv2.warpPerspective(ref_edge, H, (mask.shape[1], mask.shape[0]))
+        warped_edges.append(warped)
+
+    losses = compute_edge_consistency_loss(ref_edge, warped_edges)
+    plt.plot(losses)
+    plt.title("Edge Consistency Loss over Frames")
+    plt.xlabel("Frame")
+    plt.ylabel("L1 Edge Loss")
+    plt.grid(True)
+    plt.show()
+
+    print(f"📉 Mean Edge Consistency Loss: {np.mean(losses):.4f}")
+
+    homography_json = os.path.join(args.output_dir, "sample_video_002_7s.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
@@ -666,18 +679,6 @@ def main():
         plt.gca().invert_yaxis()
         plt.grid(True)
         plt.show()
-    # 使用你原来的 src 起始角点（如 corrected_src_points）
-#    src_pts = corrected_src_points  # shape: (4, 2)
-#    gt_traj = tracked_regions       # shape: (N, 4, 2)
-#    h_list = [np.array(h['homography_matrix']) for h in homography_results]
-    
-    # 评估
-#    errors, max_errors = evaluate_homographies(h_list, src_pts, gt_traj)
-#    plot_homography_errors(errors, max_errors)
-
-    # 也可以打印均值：
-#    print(f"Mean Homography Corner Error: {np.mean(errors):.2f}px")
-#    print(f"Max per-frame error: {np.max(max_errors):.2f}px")
 
 if __name__ == "__main__":
     main()
