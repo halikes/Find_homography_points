@@ -12,9 +12,9 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='data/sample_video_002_7s.mp4', help='Path to target video')
-parser.add_argument('--object_file', type=str, default='data/source.png', help='Path to object image')
-parser.add_argument('--output_dir', type=str, default='results/insertion', help='Directory for saving output')
+parser.add_argument('--video_file', type=str, default='Test/Video/test_video_2.mp4', help='Path to target video')
+parser.add_argument('--object_file', type=str, default='Test/Image/logo.png', help='Path to object image')
+parser.add_argument('--output_dir', type=str, default='Test/Result', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
 args = parser.parse_args()
 os.makedirs(args.output_dir, exist_ok=True)
@@ -116,8 +116,8 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
         "object_size": {"w": new_w, "h": new_h}
     }
 
-    cv2.imwrite(os.path.join(output_dir, "source_img_sample_video_02_7s_1_new.png"), source_img)
-    cv2.imwrite(os.path.join(output_dir, "mask_img_sample_video_02_7s_1_new.png"), mask_img)
+    cv2.imwrite(os.path.join(output_dir, "test_video_2_source.png"), source_img)
+    cv2.imwrite(os.path.join(output_dir, "test_video_2_mask.png"), mask_img)
 
     return fused_img, source_img, mask_img, final_params, orig_frame
 
@@ -796,7 +796,7 @@ def main():
     print(" Refining homographies with edge consistency...")
     #homography_results = refine_homographies_with_edge_structure_preserving(mask_img, homography_results)
 
-    homography_json = os.path.join(args.output_dir, "sample_video_002_7s_refine_edge_no_fine_tuning_H.json")
+    homography_json = os.path.join(args.output_dir, "test_video_2.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
