@@ -12,8 +12,8 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 # ----------------------- 参数解析 -----------------------
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str, default='Test/Video/test_video_2.mp4', help='Path to target video')
-parser.add_argument('--object_file', type=str, default='Test/Image/logo.png', help='Path to object image')
+parser.add_argument('--video_file', type=str, default='Test/Video/test_video_3.mp4', help='Path to target video')
+parser.add_argument('--object_file', type=str, default='Test/Image/bottle.png', help='Path to object image')
 parser.add_argument('--output_dir', type=str, default='Test/Result', help='Directory for saving output')
 parser.add_argument('--resize_width', type=int, default=512, help='Width to resize the first frame')
 args = parser.parse_args()
@@ -109,15 +109,15 @@ def interactive_insertion(video_file, object_file, resize_width, output_dir):
     
     mask_img = source_img.copy()
     mask_img[mask_img > 0] = 255
-
+    
     final_params = {
         "insertion_position": {"x": x, "y": y},
         "scale": scale_factor,
         "object_size": {"w": new_w, "h": new_h}
     }
 
-    cv2.imwrite(os.path.join(output_dir, "test_video_2_source.png"), source_img)
-    cv2.imwrite(os.path.join(output_dir, "test_video_2_mask.png"), mask_img)
+    cv2.imwrite(os.path.join(output_dir, "test_video_5_source.png"), source_img)
+    cv2.imwrite(os.path.join(output_dir, "test_video_5_mask.png"), mask_img)
 
     return fused_img, source_img, mask_img, final_params, orig_frame
 
@@ -201,7 +201,7 @@ def track_region_dense(video_file, region_points, resize_dim, visualize=False):
     tracked_regions.append(region_pts.tolist())
 
     # 创建调试目录保存光流图
-    debug_dir = os.path.join(args.output_dir, "flow_debug")
+    debug_dir = os.path.join(args.output_dir, "debug")
     os.makedirs(debug_dir, exist_ok=True)
 
     frame_idx = 0
@@ -229,7 +229,7 @@ def track_region_dense(video_file, region_points, resize_dim, visualize=False):
 
         # 保存当前帧光流颜色图
         flow_color = flow_to_color(flow, multiplier=50)
-        # cv2.imwrite(os.path.join(debug_dir, f"flow_frame_{frame_idx:04d}.png"), flow_color)
+        cv2.imwrite(os.path.join(debug_dir, f"flow_frame_{frame_idx:04d}.png"), flow_color)
 
         # 根据当前区域点生成多边形掩码
         mask = np.zeros((resize_dim[1], resize_dim[0]), dtype=np.uint8)
@@ -756,6 +756,7 @@ def compute_temporal_edge_consistency(mask, homographies, edge_threshold=100):
 
 # ----------------------- 主程序 -----------------------
 def main():
+    
     print("Starting interactive insertion...")
     fused_img, source_img, mask_img, ins_params, orig_frame = interactive_insertion(
         args.video_file, args.object_file, args.resize_width, args.output_dir)
@@ -780,7 +781,7 @@ def main():
     homography_results, refined_traj = compute_homography_with_residual_regularization(
         corrected_src_points, tracked_regions, smooth_method='savgol', window_length=21, polyorder=2)
     
-    print("🔍 Computing *temporal* edge consistency across frames...")
+    print("Computing *temporal* edge consistency across frames...")
     temporal_losses = compute_temporal_edge_consistency(mask_img[..., 0], homography_results)
 
     plt.plot(temporal_losses)
@@ -790,13 +791,13 @@ def main():
     plt.grid(True)
     plt.show()
 
-    print(f"📉 Mean Temporal Edge Change: {np.mean(temporal_losses):.4f}")
+    print(f"Mean Temporal Edge Change: {np.mean(temporal_losses):.4f}")
     
     # Step: 基于边缘 loss 的 Homography 微调
     print(" Refining homographies with edge consistency...")
     #homography_results = refine_homographies_with_edge_structure_preserving(mask_img, homography_results)
 
-    homography_json = os.path.join(args.output_dir, "test_video_2.json")
+    homography_json = os.path.join(args.output_dir, "test_video_3.json")
     with open(homography_json, "w") as f:
         json.dump(homography_results, f, indent=4)
     print("Homography results saved to", homography_json)
@@ -822,7 +823,7 @@ def main():
             new_proj = cv2.perspectiveTransform(src_pts_arr, H)
             new_proj_pts_list.append(new_proj.squeeze(1))
 
-        plt.figure(figsize=(8, 8))
+        plt.figure(figsize=(12, 12))
         for pts in proj_pts_list:
             plt.plot(pts[:, 0], pts[:, 1], color='gray', alpha=0.3)
         for pts in new_proj_pts_list:
